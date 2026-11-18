@@ -145,33 +145,32 @@ function classStats(students) {
   return { n: n, mean: r1(mean), median: r1(n % 2 ? v[(n - 1) / 2] : (v[n / 2 - 1] + v[n / 2]) / 2), max: v[n - 1], min: v[0], sd: r1(sd),
     pass: Math.round(100 * v.filter(function (x) { return x >= 40; }).length / n) + '%', gp: r1(avgOf(v, function (x) { return gradeOf(x).gp; })), dist: dist };
 }
-/* ---------- Charts: coloured table cells (Google's PDF conversion drops div backgrounds but keeps cell backgrounds) ---------- */
+/* ---------- Charts. Google's HTML→PDF conversion drops all background colours, so bars are coloured █ characters
+ * and trend charts are PNG images from the built-in Charts service (both tested in a real conversion). ---------- */
 function gbadge(gr) { return '<b style="color:' + GCOL[gr.g] + '">' + gr.g + '</b>'; }
-function hbar(pct, colour, h) {   // one horizontal bar, pct 0–100
-  pct = Math.round(Math.max(0, Math.min(100, pct)));
-  return '<table style="border:0;width:100%;border-collapse:collapse"><tr>' + (pct > 0 ? '<td style="border:0;padding:0;height:' + (h || 12) + 'px;width:' + pct + '%;background:' + colour + '"></td>' : '') +
-    (pct < 100 ? '<td style="border:0;padding:0;height:' + (h || 12) + 'px;background:#e5e7eb"></td>' : '') + '</tr></table>';
+function hbar(pct, colour, n) {   // n blocks wide (default 25, so one block = 4%)
+  n = n || 25; var k = Math.round(Math.max(0, Math.min(100, pct)) / 100 * n);
+  return '<span style="color:' + colour + ';letter-spacing:-1px">' + new Array(k + 1).join('█') + '</span><span style="color:#e5e7eb;letter-spacing:-1px">' + new Array(n - k + 1).join('█') + '</span>';
 }
 function hbars(rows) {   // rows: [label, value 0–100, text, colour]
   return '<table style="border:0">' + rows.map(function (r) {
-    return '<tr><td style="border:0;width:34%;padding:2px 4px">' + e(r[0]) + '</td><td style="border:0;padding:2px 0">' + hbar(r[1], r[3], 14) + '</td>' +
-      '<td style="border:0;width:16%;padding:2px 4px;text-align:right;white-space:nowrap">' + r[2] + '</td></tr>'; }).join('') + '</table>';
+    return '<tr><td style="border:0;width:34%;padding:1px 4px">' + e(r[0]) + '</td><td style="border:0;padding:1px 0;white-space:nowrap">' + hbar(r[1], r[3]) + '</td>' +
+      '<td style="border:0;width:16%;padding:1px 4px;text-align:right;white-space:nowrap">' + r[2] + '</td></tr>'; }).join('') + '</table>';
 }
-function vbar(px, total, colour, fromTop) {   // a column of height total with a coloured part of px
-  px = Math.round(px); var gap = total - px, c = px > 0 ? '<tr><td style="border:0;padding:0;height:' + px + 'px;background:' + colour + '"></td></tr>' : '', g = gap > 0 ? '<tr><td style="border:0;padding:0;height:' + gap + 'px"></td></tr>' : '';
-  return '<table style="border:0;width:100%;border-collapse:collapse">' + (fromTop ? c + g : g + c) + '</table>';
+function chartImg(kind, rows, colour, yTitle, w, h) {   // rows: [[label, number], ...]
+  try {
+    var dt = Charts.newDataTable().addColumn(Charts.ColumnType.STRING, 'x').addColumn(Charts.ColumnType.NUMBER, yTitle || 'y');
+    rows.forEach(function (r) { dt.addRow([String(r[0]), r[1]]); });
+    var c = (kind === 'line' ? Charts.newLineChart() : Charts.newColumnChart()).setDataTable(dt.build()).setColors([colour]).setLegendPosition(Charts.Position.NONE)
+      .setDimensions(w || 680, h || 220).setYAxisTitle(yTitle || '').build();
+    return '<img src="data:image/png;base64,' + Utilities.base64Encode(c.getAs('image/png').getBytes()) + '" width="' + (w || 680) + '">';
+  } catch (err) { return '<p class="muted">(Chart could not be drawn: ' + e(String(err)) + ')</p>'; }
 }
-function columns(vals, labels, colour, height, fmt) {   // vertical bars; negative values hang below the line in red
-  var mx = Math.max.apply(null, vals.map(function (v) { return Math.abs(v); }).concat([1])), H = height || 90, hasNeg = vals.some(function (v) { return v < 0; });
-  var top = vals.map(function (v) { return '<td style="border:0;padding:0 1px;vertical-align:bottom">' + vbar(Math.max(0, v) / mx * H, H, colour) + '</td>'; }).join('');
-  var bot = hasNeg ? '<tr>' + vals.map(function (v) { return '<td style="border:0;border-top:1px solid #6b7280;padding:0 1px;vertical-align:top">' + vbar(Math.max(0, -v) / mx * H / 2, Math.round(H / 2), '#dc2626', true) + '</td>'; }).join('') + '</tr>' : '';
-  var lab = labels ? '<tr>' + labels.map(function (l) { return '<td style="border:0;padding:0;font-size:7pt;text-align:center;color:#6b7280">' + e(l) + '</td>'; }).join('') + '</tr>' : '';
-  return '<table style="border:0;table-layout:fixed"><tr>' + top + '</tr>' + bot + lab + '</table>' + (fmt ? '<div class="muted">Scale: tallest bar = ' + fmt(mx) + '</div>' : '');
-}
+function rupees(gc, cur) { var c = CUR_INFO[cur] || CUR_INFO.INR; return Math.round(gc / 100 * c[0] * 100) / 100; }
 function gradeHistogram(dist) {
-  var keys = GRADES.map(function (g) { return g[1]; }), mx = Math.max.apply(null, keys.map(function (k) { return dist[k]; }).concat([1]));
-  return '<table style="border:0;width:70%"><tr>' + keys.map(function (k) { return '<td style="border:0;vertical-align:bottom;text-align:center;padding:0 6px"><div style="font-size:8pt">' + dist[k] + '</div>' + vbar(dist[k] / mx * 80, 80, GCOL[k]) + '</td>'; }).join('') +
-    '</tr><tr>' + keys.map(function (k) { return '<td style="border:0;text-align:center;color:' + GCOL[k] + '"><b>' + k + '</b></td>'; }).join('') + '</tr></table>';
+  return chartImg('column', GRADES.map(function (g) { return [g[1], dist[g[1]]]; }), '#2563eb', 'Students', 520, 200) +
+    '<table style="width:70%"><tr>' + GRADES.map(function (g) { return '<th style="text-align:center;color:' + GCOL[g[1]] + '">' + g[1] + '</th>'; }).join('') + '</tr><tr>' +
+    GRADES.map(function (g) { return '<td style="text-align:center">' + dist[g[1]] + '</td>'; }).join('') + '</tr></table>';
 }
 var SCHEME = '<div class="muted">Strict marking: concept mark = score² ÷ 100 (90 → 81, 70 → 49, 50 → 25); area mark = average of its concepts; marks = average of areas × evidence factor (full marks need ' + EVIDENCE_DAYS +
   ' game days). Caps: jail = F, equipment lost to a lender ≤ 49, any bribe ≤ 59. Grades: S 90–100 (10), A 80–89.9 (9), B 70–79.9 (8), C 60–69.9 (7), D 50–59.9 (6), E 40–49.9 (4), F below 40 (0).</div>';
@@ -196,9 +195,9 @@ function studentHtml(s, g, all) {
   h += '<p><b>Strongest area:</b> ' + e(best[0].area) + ' (' + best[0].m + '%). <b>Weakest area:</b> ' + e(best[best.length - 1].area) + ' (' + best[best.length - 1].m + '%).</p>';
   // daily trend charts
   var D = s.days.slice(-60);
-  h += '<h2>Daily profit</h2>' + columns(D.map(function (d) { return d.np; }), D.map(function (d, i) { return i % 5 === 0 ? 'D' + d.d : ''; }), '#16a34a', 80, function (x) { return money(x, cur); }) +
-    '<div class="muted">Green bars: profit; red bars below the line: loss. Last ' + D.length + ' days.</div>';
-  h += '<h2>Net worth</h2>' + columns(D.map(function (d) { return d.nw; }), D.map(function (d, i) { return i % 5 === 0 ? 'D' + d.d : ''; }), '#2563eb', 70, function (x) { return money(x, cur); });
+  h += '<h2>Daily profit (' + (CUR_INFO[cur] || CUR_INFO.INR)[1] + ')</h2>' + chartImg('column', D.map(function (d) { return ['D' + d.d, rupees(d.np, cur)]; }), '#16a34a', 'Profit') +
+    '<div class="muted">Bars below zero are loss-making days. Last ' + D.length + ' days.</div>';
+  h += '<h2>Net worth (' + (CUR_INFO[cur] || CUR_INFO.INR)[1] + ')</h2>' + chartImg('line', D.map(function (d) { return ['D' + d.d, rupees(d.nw, cur)]; }), '#2563eb', 'Net worth', 680, 200);
   var r = function (l, v, x) { return '<tr><td>' + l + '</td><td class="n"><b>' + v + '</b></td><td class="muted">' + x + '</td></tr>'; };
   h += '<h2>Key numbers</h2><table><tr><th>Measure</th><th>Value</th><th>What it shows</th></tr>' +
     r('Profitable days', pc(k.profitableShare), 'How often the stand made money') +
@@ -499,7 +498,7 @@ function conceptScores(days, k, cur) {
   return { list: out, missing: missing };
 }
 function conceptHtml(c) {
-  var bar = hbar(c.m, GCOL[c.gr.g], 6);
+  var bar = '<div style="font-size:6pt;line-height:6pt">' + hbar(c.m, GCOL[c.gr.g], 50) + '</div>';
   return '<div style="border:1px solid #d1d5db;padding:6px 8px;margin:0 0 6px;page-break-inside:avoid"><table style="border:0"><tr><td style="border:0;padding:0"><b>' + e(c.name) + '</b></td><td style="border:0;padding:0;text-align:right;white-space:nowrap">Score ' + c.s + ' → mark <b>' + c.m + '%</b> ' + gbadge(c.gr) + '</td></tr></table>' + bar +
     '<div class="muted" style="margin-top:4px"><b>Concept:</b> ' + e(c.what) + '<br><b>In the game:</b> ' + e(c.applied) + '</div>' +
     (c.calc ? '<div style="margin-top:3px;background:#f3f4f6;padding:3px 5px">🧮 <b>Calculation:</b> ' + e(c.calc) + ' Strict mark = ' + c.s + '² ÷ 100 = ' + c.m + '% → grade ' + c.gr.g + ' (' + c.gr.gp + ' points).</div>' : '') +
