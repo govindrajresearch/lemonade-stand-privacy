@@ -14,11 +14,17 @@ var CUR_INFO = { USD: [1, '$'], EUR: [1, '€'], GBP: [1, '£'], CAD: [1, 'C$'],
 
 // reportsAll() redoes every PDF. A big class may need several 6-minute runs: each run stops safely at 4.5 minutes,
 // remembers which PDFs are done, and schedules reportsContinue() a minute later until everything is written.
-function reportsAll() { PropertiesService.getScriptProperties().setProperty('rep_force', String(Date.now())); reports(); }
+function reportsAll() { var p = PropertiesService.getScriptProperties(); p.setProperty('rep_force', String(Date.now())); p.deleteProperty('rep_cycle'); reports(); }
 function reportsContinue() { reports(); }
+var REP_CUTOFF = new Date(8.64e15);   // set by reports(): the start of the current round
 
 function reports() {   // takes no arguments: a trigger passes an event object, which must not mean "redo everything"
   var started = Date.now(), props = PropertiesService.getScriptProperties(), force = props.getProperty('rep_force') || '0';
+  // One round of reports uses the data as it was when the round began, so students playing meanwhile cannot keep it
+  // running forever; their newer days go into the next round.
+  var cycle = props.getProperty('rep_cycle');
+  if (!cycle || started - Number(cycle) > 24 * 3600 * 1000) { cycle = String(started); props.setProperty('rep_cycle', cycle); }   // a stuck round never freezes data for long
+  REP_CUTOFF = new Date(Number(cycle));
   var outOfTime = function () { return Date.now() - started > 4.5 * 60 * 1000; };
   var groups = query('groups', null), byCollege = {}, rows = [], groupRows = [], cache = {}, done = 0, left = 0, changed = false;
   groups.forEach(function (gd) {
@@ -54,7 +60,7 @@ function reports() {   // takes no arguments: a trigger passes an event object, 
   });
   if (!left && (changed || props.getProperty('rep_college') !== force))
     Object.keys(byCollege).forEach(function (c) { savePdf(path([REPORTS_FOLDER, c]), 'College summary', collegeHtml(c, byCollege[c])); });
-  if (!left) props.setProperty('rep_college', force);
+  if (!left) { props.setProperty('rep_college', force); props.deleteProperty('rep_cycle'); }
   writeIndex(rows, groupRows);
   ScriptApp.getProjectTriggers().forEach(function (t) { if (t.getHandlerFunction() === 'reportsContinue') ScriptApp.deleteTrigger(t); });
   if (left) ScriptApp.newTrigger('reportsContinue').timeBased().after(60 * 1000).create();
@@ -73,7 +79,7 @@ function studentReport(mb, cache) {
     .map(function (d) { var f = d.fields || {}, days = []; try { days = JSON.parse(val(f.days) || '[]'); } catch (e) {} return { t: new Date(val(f.t)), days: days }; })
     .sort(function (a, b) { return a.t - b.t; });
   var days = [];
-  cache[mb.pid].forEach(function (r) { if (r.t >= mb.t) days = days.concat(r.days); });
+  cache[mb.pid].forEach(function (r) { if (r.t >= mb.t && r.t <= REP_CUTOFF) days = days.concat(r.days); });
   // Attempts rule: every game started after joining the group is an attempt. Each attempt is marked on its own
   // (one with fewer than 5 days scores 0) and the final marks are the average of all attempts, so every failed
   // attempt brings the average down. The latest game is left out while it is still under 5 days (in progress).
