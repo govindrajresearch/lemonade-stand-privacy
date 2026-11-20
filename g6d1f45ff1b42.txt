@@ -25,6 +25,20 @@ function reports() {   // takes no arguments: a trigger passes an event object, 
   var cycle = props.getProperty('rep_cycle');
   if (!cycle || started - Number(cycle) > 24 * 3600 * 1000) { cycle = String(started); props.setProperty('rep_cycle', cycle); }   // a stuck round never freezes data for long
   REP_CUTOFF = new Date(Number(cycle));
+  // Firestore reads are rationed (50,000 a day on the free plan): a round reads Firestore once and keeps a gzipped copy
+  // in Drive, so its continuation batches read nothing from Firestore.
+  var snapFresh = !loadSnap(cycle);
+  try { reportsRun(started, props, force, snapFresh, cycle); }
+  catch (err) {
+    if (String(err).indexOf('Firestore 429') < 0) throw err;
+    Logger.log('Firestore daily read limit reached. Reports will continue by themselves at 1:45 pm India time, after it resets.');
+    ScriptApp.getProjectTriggers().forEach(function (t) { if (t.getHandlerFunction() === 'reportsContinue') ScriptApp.deleteTrigger(t); });
+    var at = new Date(); at.setUTCHours(8, 15, 0, 0); if (at <= new Date()) at.setUTCDate(at.getUTCDate() + 1);   // 1:45 pm IST, after the quota resets
+    ScriptApp.newTrigger('reportsContinue').timeBased().at(at).create();
+  }
+}
+
+function reportsRun(started, props, force, snapFresh, cycle) {
   var outOfTime = function () { return Date.now() - started > 4.5 * 60 * 1000; };
   var groups = query('groups', null), byCollege = {}, rows = [], groupRows = [], cache = {}, done = 0, left = 0, changed = false;
   groups.forEach(function (gd) {
@@ -61,6 +75,7 @@ function reports() {   // takes no arguments: a trigger passes an event object, 
   if (!left && (changed || props.getProperty('rep_college') !== force))
     Object.keys(byCollege).forEach(function (c) { savePdf(path([REPORTS_FOLDER, c]), 'College summary', collegeHtml(c, byCollege[c])); });
   if (!left) { props.setProperty('rep_college', force); props.deleteProperty('rep_cycle'); }
+  if (snapFresh && left) saveSnap(cycle);
   writeIndex(rows, groupRows);
   ScriptApp.getProjectTriggers().forEach(function (t) { if (t.getHandlerFunction() === 'reportsContinue') ScriptApp.deleteTrigger(t); });
   if (left) ScriptApp.newTrigger('reportsContinue').timeBased().after(60 * 1000).create();
@@ -68,7 +83,26 @@ function reports() {   // takes no arguments: a trigger passes an event object, 
 }
 
 /* ---------- Firestore ---------- */
+var SNAP = null;   // this round's copy of every Firestore query: key -> documents
 function query(collection, filter) {
+  var key = collection + '|' + (filter ? filter.field + '=' + filter.value.stringValue : '');
+  if (SNAP && SNAP[key]) return SNAP[key];
+  var docs = queryFirestore(collection, filter);
+  if (SNAP) SNAP[key] = docs;
+  return docs;
+}
+function snapFile() { var f = path([REPORTS_FOLDER]).getFilesByName('report-data-snapshot.gz'); return f.hasNext() ? f.next() : null; }
+function loadSnap(cycle) {   // true when this round's saved copy was loaded
+  SNAP = {};
+  var f = snapFile(); if (!f) return false;
+  try { var o = JSON.parse(Utilities.ungzip(f.getBlob().setContentType('application/x-gzip')).getDataAsString()); if (o.cycle === cycle) { SNAP = o.snap; return true; } } catch (e) {}
+  return false;
+}
+function saveSnap(cycle) {
+  var old = snapFile(); if (old) old.setTrashed(true);
+  path([REPORTS_FOLDER]).createFile(Utilities.gzip(Utilities.newBlob(JSON.stringify({ cycle: cycle, snap: SNAP }), 'application/json'), 'report-data-snapshot.gz'));
+}
+function queryFirestore(collection, filter) {
   var q = { from: [{ collectionId: collection }] };
   if (filter) q.where = { fieldFilter: { field: { fieldPath: filter.field }, op: filter.op, value: filter.value } };
   return api('post', BASE + ':runQuery', { structuredQuery: q }).filter(function (x) { return x.document; }).map(function (x) { return x.document; });
