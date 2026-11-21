@@ -1,0 +1,1442 @@
+/**
+ * Lemonade Stand — MBA skills reports for groups (classes and competitions).
+ * Reads groups, members and decision logs from Firestore and writes PDFs to Google Drive:
+ *   Lemonade Stand Archive / Reports / <College> / <Group (CODE)> / <Student (Player ID)>.pdf
+ *   … plus "Group summary" in each group folder, "College summary" in each college folder,
+ *   and the spreadsheet "Lemonade Stand reports" (Students and Groups tabs) with a link to every PDF.
+ * Run reports() any time (it only redoes PDFs with new data), or reportsAll() to redo everything; long runs continue by themselves.
+ * setup() in Code.gs also runs it every Monday morning. Uses api(), val(), BASE and FOLDER from Code.gs.
+ * Covers decisions still in Firebase (the last 180 days); older days are in the monthly archive sheets.
+ */
+var REPORTS_FOLDER = 'Reports';
+var CUR_INFO = { USD: [1, '$'], EUR: [1, '€'], GBP: [1, '£'], CAD: [1, 'C$'], AUD: [2, 'A$'], CHF: [2, 'CHF '], INR: [50, '₹'], CNY: [5, 'CN¥'],
+  JPY: [100, '¥'], KRW: [1000, '₩'], IDR: [10000, 'Rp '], BRL: [5, 'R$'], MXN: [20, 'MX$'], NGN: [1000, '₦'] };
+
+// reportsAll() redoes every PDF. A big class may need several 6-minute runs: each run stops safely at 4.5 minutes,
+// remembers which PDFs are done, and schedules reportsContinue() a minute later until everything is written.
+function reportsAll() { var p = PropertiesService.getScriptProperties(); p.setProperty('rep_force', String(Date.now())); p.deleteProperty('rep_cycle'); reports(); }
+function reportsContinue() { reports(); }
+var REP_CUTOFF = new Date(8.64e15);   // set by reports(): the start of the current round
+
+function reports() {   // takes no arguments: a trigger passes an event object, which must not mean "redo everything"
+  var started = Date.now(), props = PropertiesService.getScriptProperties(), force = props.getProperty('rep_force') || '0';
+  // One round of reports uses the data as it was when the round began, so students playing meanwhile cannot keep it
+  // running forever; their newer days go into the next round.
+  var cycle = props.getProperty('rep_cycle');
+  if (!cycle || started - Number(cycle) > 24 * 3600 * 1000) { cycle = String(started); props.setProperty('rep_cycle', cycle); }   // a stuck round never freezes data for long
+  REP_CUTOFF = new Date(Number(cycle));
+  // Firestore reads are rationed (50,000 a day on the free plan): a round reads Firestore once and keeps a gzipped copy
+  // in Drive, so its continuation batches read nothing from Firestore.
+  var snapFresh = !loadSnap(cycle);
+  try { reportsRun(started, props, force, snapFresh, cycle); }
+  catch (err) {
+    if (String(err).indexOf('Firestore 429') < 0) throw err;
+    Logger.log('Firestore daily read limit reached. Reports will continue by themselves at 1:45 pm India time, after it resets.');
+    ScriptApp.getProjectTriggers().forEach(function (t) { if (t.getHandlerFunction() === 'reportsContinue') ScriptApp.deleteTrigger(t); });
+    var at = new Date(); at.setUTCHours(8, 15, 0, 0); if (at <= new Date()) at.setUTCDate(at.getUTCDate() + 1);   // 1:45 pm IST, after the quota resets
+    ScriptApp.newTrigger('reportsContinue').timeBased().at(at).create();
+  }
+}
+
+function reportsRun(started, props, force, snapFresh, cycle) {
+  var outOfTime = function () { return Date.now() - started > 4.5 * 60 * 1000; };
+  var groups = query('groups', null), byCollege = {}, rows = [], groupRows = [], cache = {}, done = 0, left = 0, changed = false, MOD = readModeration();
+  groups.forEach(function (gd) {
+    var code = gd.name.split('/').pop(), f = gd.fields || {};
+    var g = { code: code, name: val(f.name), college: val(f.college) || 'No college', batch: val(f.batch), ownerName: val(f.ownerName) };
+    var members = query('members', { field: 'code', op: 'EQUAL', value: { stringValue: code } }).map(function (d) {
+      var mf = d.fields || {}; return { pid: val(mf.pid), name: val(mf.name), college: val(mf.college), t: new Date(val(mf.t)) };
+    });
+    if (!members.length) return;
+    var students = members.map(function (mb) { return studentReport(mb, cache); });
+    var folder = path([REPORTS_FOLDER, g.college, g.name + ' (' + code + ')']);
+    sortStudents(students);
+    // A student's PDF changes when anyone's days change (ranks and class averages), so the group's data is in each stamp.
+    var gStamp = 'g3|' + force + '|' + students.map(function (s) { return s.pid + ':' + s.att.map(function (a) { return a.days.length; }).join('.'); }).join('|');
+    var gLeft = 0;
+    students.forEach(function (s, i) {
+      /* rank set by sortStudents */
+      var key = 'rs_' + code + '_' + s.pid, name = s.name + ' (' + s.pid + ')';
+      s.mod = MOD[code + '|' + s.pid] || { m: '', c: '' };
+      var stamp = gStamp + '|' + s.mod.m + '|' + s.mod.c;   // a new moderated mark or comment redoes this PDF
+      if (props.getProperty(key) === stamp) s.url = fileUrl(folder, name);
+      else if (outOfTime()) { gLeft++; s.url = fileUrl(folder, name); }
+      else { s.url = savePdf(folder, name, studentHtml(s, g, students)); props.setProperty(key, stamp); done++; changed = true; }
+      rows.push([new Date(), g.college, g.name, code, g.batch, s.name, s.pid, s.days.length, s.restarts].concat(s.mk ? [s.mk.marks, s.mk.gr.g, s.mk.gr.gp]
+        .concat(AREA_ORDER.map(function (a) { var x = areaOf(s, a); return x ? x.m : ''; })) : ['', 'Not graded (under 5 days)', ''].concat(AREA_ORDER.map(function () { return ''; }))).concat([s.url, s.mod.m, s.mod.c]));
+    });
+    var gUrl;
+    if (props.getProperty('rep_' + code) === gStamp) gUrl = fileUrl(folder, 'Group summary');
+    else if (gLeft || outOfTime()) { gLeft++; gUrl = fileUrl(folder, 'Group summary'); }
+    else { gUrl = savePdf(folder, 'Group summary', groupHtml(g, students)); props.setProperty('rep_' + code, gStamp); changed = true; }
+    left += gLeft;
+    var st = classStats(students);
+    groupRows.push([g.college, g.name, code, g.batch, g.ownerName, students.length, st.n, st.n ? st.mean : '', st.n ? st.pass : '', gUrl]);
+    (byCollege[g.college] = byCollege[g.college] || []).push({ g: g, students: students });
+  });
+  if (!left && (changed || props.getProperty('rep_college') !== force))
+    Object.keys(byCollege).forEach(function (c) { savePdf(path([REPORTS_FOLDER, c]), 'College summary', collegeHtml(c, byCollege[c])); });
+  if (!left) { props.setProperty('rep_college', force); props.deleteProperty('rep_cycle'); }
+  if (snapFresh && left) saveSnap(cycle);
+  writeIndex(rows, groupRows);
+  ScriptApp.getProjectTriggers().forEach(function (t) { if (t.getHandlerFunction() === 'reportsContinue') ScriptApp.deleteTrigger(t); });
+  if (left) ScriptApp.newTrigger('reportsContinue').timeBased().after(60 * 1000).create();
+  Logger.log('Groups: ' + groups.length + ', student PDFs written: ' + done + (left ? ', still to do: ' + left + ' (continuing automatically in about a minute)' : ', all reports up to date'));
+}
+
+/* ---------- Firestore ---------- */
+var SNAP = null;   // this round's copy of every Firestore query: key -> documents
+function query(collection, filter) {
+  var key = collection + '|' + (filter ? filter.field + '=' + filter.value.stringValue : '');
+  if (SNAP && SNAP[key]) return SNAP[key];
+  var docs = queryFirestore(collection, filter);
+  if (SNAP) SNAP[key] = docs;
+  return docs;
+}
+function snapFile() { var f = path([REPORTS_FOLDER]).getFilesByName('report-data-snapshot.gz'); return f.hasNext() ? f.next() : null; }
+function loadSnap(cycle) {   // true when this round's saved copy was loaded
+  SNAP = {};
+  var f = snapFile(); if (!f) return false;
+  try { var o = JSON.parse(Utilities.ungzip(f.getBlob().setContentType('application/x-gzip')).getDataAsString()); if (o.cycle === cycle) { SNAP = o.snap; return true; } } catch (e) {}
+  return false;
+}
+function saveSnap(cycle) {
+  var old = snapFile(); if (old) old.setTrashed(true);
+  path([REPORTS_FOLDER]).createFile(Utilities.gzip(Utilities.newBlob(JSON.stringify({ cycle: cycle, snap: SNAP }), 'application/json'), 'report-data-snapshot.gz'));
+}
+function queryFirestore(collection, filter) {
+  var q = { from: [{ collectionId: collection }] };
+  if (filter) q.where = { fieldFilter: { field: { fieldPath: filter.field }, op: filter.op, value: filter.value } };
+  return api('post', BASE + ':runQuery', { structuredQuery: q }).filter(function (x) { return x.document; }).map(function (x) { return x.document; });
+}
+/* All decision days a member saved since joining the group (research records are batches of days). */
+function studentReport(mb, cache) {
+  if (!cache[mb.pid]) cache[mb.pid] = query('research', { field: 'pid', op: 'EQUAL', value: { stringValue: mb.pid } })
+    .map(function (d) { var f = d.fields || {}, days = []; try { days = JSON.parse(val(f.days) || '[]'); } catch (e) {} return { t: new Date(val(f.t)), days: days }; })
+    .sort(function (a, b) { return a.t - b.t; });
+  var days = [];
+  cache[mb.pid].forEach(function (r) { if (r.t >= mb.t && r.t <= REP_CUTOFF) days = days.concat(r.days); });
+  // Attempts rule (grading v2): every game started after joining the group is an attempt. A game restarted while the
+  // stand still had money is ABANDONED and ignored; one that ended out of money is FAILED (−5 marks each, at most −15).
+  // The best attempt of 5 or more days is graded. The latest game under 5 days is in progress and not counted yet.
+  var games = []; days.forEach(function (d) { if (games.indexOf(d.g) < 0) games.push(d.g); });
+  var cur = days.length ? days[days.length - 1].cur || 'INR' : 'INR';
+  var att = games.map(function (g, i) {
+    var dd = days.filter(function (d) { return d.g === g; }), k = SK.kpis(dd), sk = SK.skills(k), cs = sk ? conceptScores(dd, k, cur) : null;
+    var current = i === games.length - 1, last = dd[dd.length - 1];
+    var status = current ? (dd.length < MIN_DAYS ? 'progress' : 'current') : (wentBroke(dd) ? 'failed' : 'abandoned');
+    return { n: i + 1, days: dd, k: k, sk: sk, cs: cs, mk: cs && cs.list.length && dd.length >= MIN_DAYS ? marksFor(cs, dd) : null, current: current, status: status };
+  });
+  var failed = att.filter(function (a) { return a.status === 'failed'; }).length;
+  var detail = att.filter(function (a) { return a.mk; }).sort(function (a, b) { return b.mk.marks - a.mk.marks || b.days.length - a.days.length; })[0] ||
+    att[att.length - 1] || { n: 0, days: [], k: SK.kpis([]), sk: null, cs: null, mk: null };
+  var mk = null;
+  if (detail.mk) {
+    var pen = Math.min(15, 5 * failed), fin = r1(Math.max(0, detail.mk.marks - pen));
+    mk = {}; Object.keys(detail.mk).forEach(function (x) { mk[x] = detail.mk[x]; });
+    mk.caps = detail.mk.caps.slice(); mk.attempt = detail.mk.marks; mk.failed = failed; mk.failPen = pen; mk.marks = fin; mk.gr = gradeOf(fin);
+    if (pen) mk.caps.push(failed + ' failed game' + (failed > 1 ? 's' : '') + ' (ran out of money): −' + pen);
+    mk.inc = !REP_FINAL && detail.days.length < EVIDENCE_DAYS && fin < 40;
+    if (mk.inc) mk.gr = INC;
+  }
+  return { pid: mb.pid, name: mb.name || mb.pid, college: mb.college, days: detail.days, k: detail.k, sk: detail.sk, cur: cur, cs: detail.cs, mk: mk,
+    att: att, detailN: detail.n, games: games.length, restarts: Math.max(0, games.length - 1), failed: failed };
+}
+/* A game ended out of money: the last day's cash cannot buy a pitcher and net worth is nearly gone, or the student went to jail. */
+function wentBroke(dd) {
+  var l = dd[dd.length - 1]; if (!l) return false;
+  return (l.cash < 200 && l.nw < 2000) || dd.some(function (d, i) { return d.sz > 0 && i > 0 && dd[i - 1].bk > 0 && dd[i - 1].rj > 0; });
+}
+
+/* ---------- Drive ---------- */
+function path(parts) {
+  var it = DriveApp.getFoldersByName(FOLDER), f = it.hasNext() ? it.next() : DriveApp.createFolder(FOLDER);
+  parts.forEach(function (p) { p = String(p).replace(/[\/\\]/g, '-').slice(0, 100); var s = f.getFoldersByName(p); f = s.hasNext() ? s.next() : f.createFolder(p); });
+  return f;
+}
+function savePdf(folder, name, html) {
+  var blob = Utilities.newBlob(html, MimeType.HTML, name + '.html').getAs(MimeType.PDF).setName(name + '.pdf');
+  var old = folder.getFilesByName(name + '.pdf');
+  if (old.hasNext()) {   // replace the contents in place, so links already opened or shared show the latest report
+    var f = old.next();
+    UrlFetchApp.fetch('https://www.googleapis.com/upload/drive/v3/files/' + f.getId() + '?uploadType=media', { method: 'patch', contentType: 'application/pdf',
+      payload: blob.getBytes(), headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() } });
+    while (old.hasNext()) old.next().setTrashed(true);
+    return f.getUrl();
+  }
+  return folder.createFile(blob).getUrl();
+}
+function fileUrl(folder, name) { var f = folder.getFilesByName(name + '.pdf'); return f.hasNext() ? f.next().getUrl() : ''; }
+/* Faculty moderation typed into the index sheet (Students tab): kept across runs and printed in the student's PDF. */
+function readModeration() {
+  var out = {}, files = path([REPORTS_FOLDER]).getFilesByName('Lemonade Stand reports');
+  if (!files.hasNext()) return out;
+  var sh = SpreadsheetApp.open(files.next()).getSheetByName('Students'); if (!sh || sh.getLastRow() < 2) return out;
+  var v = sh.getDataRange().getValues(), h = v[0], ci = h.indexOf('Code'), pi = h.indexOf('Player ID'), mi = h.indexOf('Moderated marks %'), fi = h.indexOf('Faculty comment');
+  if (ci < 0 || pi < 0 || (mi < 0 && fi < 0)) return out;
+  v.slice(1).forEach(function (r) {
+    var m = mi < 0 ? '' : r[mi], c = fi < 0 ? '' : String(r[fi] || '').trim();
+    m = m === '' || m === null || isNaN(Number(m)) ? '' : Math.max(0, Math.min(100, Math.round(Number(m) * 10) / 10));
+    if (m !== '' || c) out[r[ci] + '|' + r[pi]] = { m: m, c: c.slice(0, 1000) };
+  });
+  return out;
+}
+function writeIndex(rows, groupRows) {
+  var root = path([REPORTS_FOLDER]), files = root.getFilesByName('Lemonade Stand reports'), ss;
+  if (files.hasNext()) ss = SpreadsheetApp.open(files.next());
+  else { ss = SpreadsheetApp.create('Lemonade Stand reports'); DriveApp.getFileById(ss.getId()).moveTo(root); ss.getSheets()[0].setName('Students'); ss.insertSheet('Groups'); }
+  var put = function (name, head, data) {
+    var sh = ss.getSheetByName(name); sh.clear(); sh.appendRow(head); sh.setFrozenRows(1); sh.getRange(1, 1, 1, head.length).setFontWeight('bold');
+    if (data.length) sh.getRange(2, 1, data.length, head.length).setValues(data);
+  };
+  put('Students', ['Updated', 'College', 'Group', 'Code', 'Batch', 'Student', 'Player ID', 'Days graded', 'Restarts', 'Marks %', 'Grade', 'Grade points'].concat(AREA_ORDER).concat(['Report PDF', 'Moderated marks %', 'Faculty comment']), rows);
+  put('Groups', ['College', 'Group', 'Code', 'Batch', 'Created by', 'Students', 'Graded', 'Average marks %', 'Pass rate', 'Group summary PDF'], groupRows);
+}
+
+/* ---------- PDF pages ---------- */
+var CSS = '<style>body{font-family:Arial,sans-serif;font-size:10pt;color:#1f2937}h1{font-size:17pt;color:#9a6700;margin:0}h2{font-size:12pt;margin:16px 0 6px;color:#374151}' +
+  'table{border-collapse:collapse;width:100%}td,th{border:1px solid #d1d5db;padding:5px 6px;text-align:left;vertical-align:top}th{background:#fef3c7}' +
+  '.big{font-size:22pt;font-weight:bold;color:#15803d}.muted{color:#6b7280;font-size:8.5pt}.n{text-align:right}.box{border:1px solid #9ca3af;height:90px}</style>';
+function e(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; }); }
+function money(gc, cur) {
+  var c = CUR_INFO[cur] || CUR_INFO.INR, d = c[0] <= 5 ? 2 : 0;   // cents for dollar-like currencies
+  return gc == null ? '—' : (gc < 0 ? '−' : '') + c[1] + (Math.abs(gc) / 100 * c[0]).toLocaleString('en-IN', { minimumFractionDigits: d, maximumFractionDigits: d });
+}
+function pc(x) { return x == null ? '—' : Math.round(x * 100) + '%'; }
+function stars(s) { var n = Math.round(s / 20); return '★★★★★'.slice(0, n) + '☆☆☆☆☆'.slice(n); }
+function avgOf(a, f) { return a.length ? a.reduce(function (s, x) { return s + f(x); }, 0) / a.length : 0; }
+function head(title, sub) { return '<html><head><meta charset="utf-8">' + CSS + '</head><body><h1>🍋 ' + e(title) + '</h1><div class="muted">' + sub + '</div>'; }
+var FOOT = '<p class="muted">Lemonade Stand: Business Sim · reports by Dr. Govindraj R. Mane, Department of MBA, KLS Gogte Institute of Technology, Belagavi. ' +
+  'Marks are computed from the student\'s own game decisions.</p></body></html>';
+/* ---------- Grading rules, version 2 (agreed 21 Nov 2026; see the "Grading Rules (Version 2)" document) ----------
+ * Graded attempt marks out of 100:
+ *   A. Management concepts (65): each concept 0–100 from the student's decisions; area = plain average of its concepts
+ *      (no squaring); areas weighted Finance 14, Operations 12, Marketing 12, Economics 8, Strategy 8, People 3, Ethics 3;
+ *      an area never met is left out and its weight shared by the others.
+ *   B. Business results (25): average daily profit (15) and net worth growth a day (10), each against a benchmark per
+ *      difficulty (Easy ₹1,500, Normal ₹1,000, Hard ₹700 a day), straight line from ₹0.
+ *   C. Persistence (10): days played, 0 at 5 days, full at 30.
+ * (A + B) × evidence factor (days ÷ 15, at most 1) + C, then: −3 per bribe (at most −15); 5+ bribes → at most 49;
+ * equipment seized → at most 49; jail → 0. Then −5 per failed game (at most −15, in studentReport). Never below 0.
+ * Incomplete: graded attempt under 15 days and marks below 40, until the group's reports are marked Final. */
+var GRADES = [[90, 'S', 10], [80, 'A', 9], [70, 'B', 8], [60, 'C', 7], [50, 'D', 6], [40, 'E', 4], [0, 'F', 0]];
+var GCOL = { S: '#166534', A: '#15803d', B: '#2563eb', C: '#0e7490', D: '#b45309', E: '#c2410c', F: '#b91c1c', I: '#6b7280' };
+var INC = { g: 'I', gp: 0 };
+var AREA_ORDER = ['Finance and accounting', 'Operations and supply chain', 'Marketing and pricing', 'Economics and decision-making', 'Strategy and growth', 'People and organisation', 'Ethics and compliance'];
+var AREA_W = { 'Finance and accounting': 14, 'Operations and supply chain': 12, 'Marketing and pricing': 12, 'Economics and decision-making': 8, 'Strategy and growth': 8, 'People and organisation': 3, 'Ethics and compliance': 3 };
+var BENCH = { easy: 3000, normal: 2000, hard: 1400 };   // game cents a day (₹1 = 2 G¢): ₹1,500, ₹1,000, ₹700
+var EVIDENCE_DAYS = 15, MIN_DAYS = 5, FULL_DAYS = 30;
+var REP_FINAL = false;   // the group's reports are marked Final: Incomplete students get their calculated grade
+function r1(x) { return Math.round(x * 10) / 10; }
+function gradeOf(m) { for (var i = 0; i < GRADES.length; i++) if (m >= GRADES[i][0]) return { g: GRADES[i][1], gp: GRADES[i][2] }; return { g: 'F', gp: 0 }; }
+function clamp01(x) { return Math.max(0, Math.min(1, x)); }
+function marksFor(cs, days) {
+  cs.list.forEach(function (c) { c.m = c.s; c.gr = gradeOf(c.s); });
+  var areas = AREA_ORDER.map(function (a) {
+    var l = cs.list.filter(function (c) { return c.area === a; }); if (!l.length) return null;
+    var m = r1(avgOf(l, function (c) { return c.s; })); return { area: a, m: m, gr: gradeOf(m), n: l.length, raw: Math.round(m), w: AREA_W[a] };
+  }).filter(Boolean);
+  var ws = areas.reduce(function (t, a) { return t + a.w; }, 0), A = ws ? areas.reduce(function (t, a) { return t + a.m * a.w; }, 0) / ws * 0.65 : 0;
+  var n = days.length, first = days[0], last = days[n - 1], dif = first.dif || 'normal', ben = BENCH[dif] || BENCH.normal;
+  var avgP = days.reduce(function (t, d) { return t + (d.np || 0); }, 0) / n, gpd = (last.nw - (first.nw - first.np)) / n;
+  var B1 = 15 * clamp01(avgP / ben), B2 = 10 * clamp01(gpd / ben), C = 10 * clamp01((n - MIN_DAYS) / (FULL_DAYS - MIN_DAYS));
+  var ev = Math.min(1, n / EVIDENCE_DAYS), base = (A + B1 + B2) * ev + C, caps = [];
+  var bribes = days.filter(function (d) { return d.of === 'bribe'; }).length, penB = Math.min(15, 3 * bribes), marks = base - penB;
+  var seized = days.some(function (d) { return d.sz > 0; }), jail = days.some(function (d, i) { return d.sz > 0 && i > 0 && days[i - 1].bk > 0 && days[i - 1].rj > 0; });
+  if (ev < 1) caps.push('Evidence factor: ' + n + ' of ' + EVIDENCE_DAYS + ' days, so Parts A and B × ' + ev.toFixed(2));
+  if (bribes) caps.push(bribes + ' bribe' + (bribes > 1 ? 's' : '') + ': −' + penB);
+  if (bribes >= 5 && marks > 49) { marks = 49; caps.push('Five or more bribes: marks capped at 49'); }
+  if (seized && marks > 49) { marks = 49; caps.push('Lost equipment to a lender: marks capped at 49'); }
+  if (jail) { marks = 0; caps.push('Went to jail (bank and moneylender default): 0 marks'); }
+  marks = r1(Math.max(0, marks));
+  return { A: r1(A), B1: r1(B1), B2: r1(B2), B: r1(B1 + B2), C: r1(C), ev: ev, base: r1(base), bribes: bribes, penB: penB, seized: seized, jail: jail,
+    avgP: avgP, gpd: gpd, ben: ben, dif: dif, raw: r1(A / 0.65), marks: marks, gr: gradeOf(marks), areas: areas, caps: caps };
+}
+/* Graded students by marks (Incomplete after them, then not graded), with their rank among the graded ones. */
+function sortStudents(students) {
+  var key = function (s) { return s.mk ? (s.mk.inc ? -1 : s.mk.marks) : -2; };
+  students.sort(function (a, b) { return key(b) - key(a) || (b.mk ? b.mk.marks : 0) - (a.mk ? a.mk.marks : 0); });
+  var r = 0; students.forEach(function (s) { s.rank = s.mk && !s.mk.inc ? ++r : null; });
+  return students;
+}
+function areaOf(s, a) { return s.mk ? s.mk.areas.filter(function (x) { return x.area === a; })[0] : null; }
+function classStats(students) {
+  var v = students.filter(function (s) { return s.mk && !s.mk.inc; }).map(function (s) { return s.mk.marks; }).sort(function (a, b) { return a - b; }), n = v.length;
+  if (!n) return { n: 0 };
+  var mean = avgOf(v, function (x) { return x; }), sd = Math.sqrt(avgOf(v, function (x) { return (x - mean) * (x - mean); }));
+  var dist = {}; GRADES.forEach(function (g) { dist[g[1]] = 0; }); v.forEach(function (x) { dist[gradeOf(x).g]++; });
+  return { n: n, mean: r1(mean), median: r1(n % 2 ? v[(n - 1) / 2] : (v[n / 2 - 1] + v[n / 2]) / 2), max: v[n - 1], min: v[0], sd: r1(sd),
+    pass: Math.round(100 * v.filter(function (x) { return x >= 40; }).length / n) + '%', gp: r1(avgOf(v, function (x) { return gradeOf(x).gp; })), dist: dist };
+}
+/* ---------- Charts. Google's HTML→PDF conversion drops all background colours, so bars are coloured █ characters
+ * and trend charts are PNG images from the built-in Charts service (both tested in a real conversion). ---------- */
+function gbadge(gr) { return '<b style="color:' + GCOL[gr.g] + '">' + gr.g + '</b>'; }
+function hbar(pct, colour, n) {   // n blocks wide (default 25, so one block = 4%)
+  n = n || 25; var k = Math.round(Math.max(0, Math.min(100, pct)) / 100 * n);
+  return '<span style="color:' + colour + ';letter-spacing:-1px">' + new Array(k + 1).join('█') + '</span><span style="color:#e5e7eb;letter-spacing:-1px">' + new Array(n - k + 1).join('█') + '</span>';
+}
+function hbars(rows) {   // rows: [label, value 0–100, text, colour]
+  return '<table style="border:0">' + rows.map(function (r) {
+    return '<tr><td style="border:0;width:34%;padding:1px 4px">' + e(r[0]) + '</td><td style="border:0;padding:1px 0;white-space:nowrap">' + hbar(r[1], r[3]) + '</td>' +
+      '<td style="border:0;width:16%;padding:1px 4px;text-align:right;white-space:nowrap">' + r[2] + '</td></tr>'; }).join('') + '</table>';
+}
+function chartImg(kind, rows, colour, yTitle, w, h) {   // rows: [[label, number], ...]
+  try {
+    var dt = Charts.newDataTable().addColumn(Charts.ColumnType.STRING, 'x').addColumn(Charts.ColumnType.NUMBER, yTitle || 'y');
+    rows.forEach(function (r) { dt.addRow([String(r[0]), r[1]]); });
+    var c = (kind === 'line' ? Charts.newLineChart() : Charts.newColumnChart()).setDataTable(dt.build()).setColors([colour]).setLegendPosition(Charts.Position.NONE)
+      .setDimensions(w || 680, h || 220).setYAxisTitle(yTitle || '').build();
+    return '<img src="data:image/png;base64,' + Utilities.base64Encode(c.getAs('image/png').getBytes()) + '" width="' + (w || 680) + '">';
+  } catch (err) { return '<p class="muted">(Chart could not be drawn: ' + e(String(err)) + ')</p>'; }
+}
+function rupees(gc, cur) { var c = CUR_INFO[cur] || CUR_INFO.INR; return Math.round(gc / 100 * c[0] * 100) / 100; }
+function gradeHistogram(dist) {
+  return chartImg('column', GRADES.map(function (g) { return [g[1], dist[g[1]]]; }), '#2563eb', 'Students', 520, 200) +
+    '<table style="width:70%"><tr>' + GRADES.map(function (g) { return '<th style="text-align:center;color:' + GCOL[g[1]] + '">' + g[1] + '</th>'; }).join('') + '</tr><tr>' +
+    GRADES.map(function (g) { return '<td style="text-align:center">' + dist[g[1]] + '</td>'; }).join('') + '</tr></table>';
+}
+
+function collegeHtml(college, list) {
+  var h = head('College Summary', e(college) + ' · ' + Utilities.formatDate(new Date(), 'Asia/Kolkata', 'd MMM yyyy')), everyone = [];
+  list.forEach(function (x) { x.students.filter(function (s) { return s.mk; }).forEach(function (s) { everyone.push({ s: s, g: x.g }); }); });
+  var all = classStats(everyone.map(function (x) { return x.s; }));
+  if (all.n) h += '<h2>All graded students: ' + all.n + '</h2><table><tr><th>Mean marks</th><th>Median</th><th>Highest</th><th>Lowest</th><th>Std. deviation</th><th>Pass rate</th><th>Mean grade points</th></tr><tr>' +
+    [all.mean + '%', all.median + '%', all.max + '%', all.min + '%', all.sd, all.pass, all.gp].map(function (x) { return '<td class="n"><b>' + x + '</b></td>'; }).join('') + '</tr></table><h2>Grade distribution</h2>' + gradeHistogram(all.dist);
+  h += '<h2>Groups</h2><table><tr><th>Group</th><th>Code</th><th>Batch</th><th>Joined</th><th>Graded</th><th>Mean marks</th><th>Pass rate</th><th>S · A · B · C · D · E · F</th></tr>' + list.map(function (x) {
+    var st = classStats(x.students);
+    return '<tr><td>' + e(x.g.name) + '</td><td>' + x.g.code + '</td><td>' + e(x.g.batch) + '</td><td class="n">' + x.students.length + '</td><td class="n">' + st.n + '</td><td class="n"><b>' + (st.n ? st.mean + '%' : '—') + '</b></td><td class="n">' + (st.n ? st.pass : '—') + '</td><td>' + (st.n ? GRADES.map(function (gg) { return st.dist[gg[1]]; }).join(' · ') : '—') + '</td></tr>'; }).join('') + '</table>';
+  if (list.length > 1) h += '<h2>Mean marks by group</h2>' + hbars(list.map(function (x) { var st = classStats(x.students); return st.n ? [x.g.name, st.mean, st.mean + '% ' + gbadge(gradeOf(st.mean)), GCOL[gradeOf(st.mean).g]] : null; }).filter(Boolean));
+  var ar = AREA_ORDER.map(function (a) { var v = everyone.map(function (x) { return areaOf(x.s, a); }).filter(Boolean).map(function (x) { return x.m; }); return v.length ? [a, r1(avgOf(v, function (x) { return x; }))] : null; }).filter(Boolean);
+  if (ar.length) h += '<h2>Area-wise performance (college average)</h2>' + hbars(ar.map(function (x) { var gr = gradeOf(x[1]); return [x[0], x[1], x[1] + '% ' + gbadge(gr), GCOL[gr.g]]; }));
+  everyone.sort(function (a, b) { return b.s.mk.marks - a.s.mk.marks; });
+  h += '<h2>Top 10 students</h2><table><tr><th>#</th><th>Student</th><th>Group</th><th>Marks</th><th>Grade</th><th>GP</th></tr>' +
+    everyone.slice(0, 10).map(function (x, i) { return '<tr><td>' + (i + 1) + '</td><td>' + e(x.s.name) + '</td><td>' + e(x.g.name) + '</td><td class="n">' + x.s.mk.marks + '%</td><td>' + gbadge(x.s.mk.gr) + '</td><td class="n">' + x.s.mk.gr.gp + '</td></tr>'; }).join('') + '</table>';
+  return h + FOOT;
+}
+
+/* ---------- Concept-by-concept scores: each MBA concept, what it is, how the game uses it, and what the student did ----------
+ * conceptScores(days, k, cur) → [{ area, name, what, applied, s (0–100), good, bad, tip }] for concepts seen in play,
+ * plus .missing: names of concepts the student never practised. Scores are rules of thumb for feedback, not exam marks. */
+var WX = { hot: [1.20, 4], sunny: [1.00, 3], cloudy: [0.95, 2], cool: [0.85, 1], rainy: [0.85, 1], stormy: [0.80, 1] };   // [fair-price factor, ideal ice]
+function conceptScores(days, k, cur) {
+  var O = days.filter(function (d) { return !d.cl; }), out = [], missing = [];
+  var cl = function (x) { return Math.max(0, Math.min(1, x)); }, P = function (x) { return Math.round(x * 100) + '%'; }, M = function (x) { return money(x, cur); };
+  var sum = function (a, f) { return a.reduce(function (s, x) { return s + f(x); }, 0); }, avg = function (a, f) { return a.length ? sum(a, f) / a.length : 0; };
+  var share = function (a, f) { return a.length ? a.filter(f).length / a.length : 0; };
+  var corr = function (pts) {
+    if (pts.length < 3) return null;
+    var mx = avg(pts, function (p) { return p[0]; }), my = avg(pts, function (p) { return p[1]; });
+    var sxy = sum(pts, function (p) { return (p[0] - mx) * (p[1] - my); }), sxx = sum(pts, function (p) { return (p[0] - mx) * (p[0] - mx); }), syy = sum(pts, function (p) { return (p[1] - my) * (p[1] - my); });
+    return sxx > 0 && syy > 0 ? sxy / Math.sqrt(sxx * syy) : null;
+  };
+  var fair = function (d) { return 100 * (WX[d.f] || WX[d.w] || [1])[0]; };
+  function add(area, name, what, applied, r) {
+    if (!r || r.s == null || isNaN(r.s)) { missing.push(name); return; }   // a score that cannot be worked out is left out, never counted as 0
+    r.s = Math.round(100 * cl(r.s)); r.area = area; r.name = name; r.what = what; r.applied = applied; out.push(r);
+  }
+  if (!O.length) return { list: [], missing: [] };
+  var rev = sum(O, function (d) { return d.rev; }), last = days[days.length - 1], first = days[0];
+  var startNW = first.nw - first.np, growth = last.nw - startNW, N = O.length;
+  var cogsT = sum(O, function (d) { return d.cogs; }), wsT = sum(O, function (d) { return d.wst + d.sp; }), byT = sum(O, function (d) { return d.by; }), pbT = sum(O, function (d) { return d.pb; }), taT = sum(O, function (d) { return d.ta; });
+  var fixedAvg = avg(O, function (d) { return d.fee + d.ad + (d.wg || 0) + (d.in || 0) + (d.lf || 0); }), of = function (x, n) { return x + ' of ' + n + ' days'; };
+
+  /* --- Finance and accounting --- */
+  var nm = rev > 0 ? k.profit / rev : null;
+  add('Finance and accounting', 'Profitability (net profit margin)', 'Net profit margin = net profit ÷ sales. It shows how much of every rupee of sales the business keeps after all costs.',
+    'Every day the P&L subtracts ingredients, waste, stand fee, advertising, wages, interest, fines and tax from sales.',
+    nm == null ? null : { calc: 'Net margin = net profit ÷ sales = ' + M(k.profit) + ' ÷ ' + M(rev) + ' = ' + P(nm) + '. Profitable days: ' + of(days.filter(function (d) { return d.np > 0; }).length, days.length) + '.', s: (nm + 0.2) / 0.6, good: nm > 0.15 ? 'You kept ' + P(nm) + ' of sales as profit, and ' + P(k.profitableShare) + ' of days were profitable.' : '',
+      bad: nm <= 0.15 ? (nm < 0 ? 'The business made a loss: net margin ' + P(nm) : 'Only ' + P(nm) + ' of sales became profit') + (k.profitableShare < 0.6 ? ', and just ' + P(k.profitableShare) + ' of days made money' : '') + '.' : '',
+      tip: 'Watch the biggest cost line on each day\'s results screen and cut it first; price a little higher on hot days.' });
+  add('Finance and accounting', 'Gross margin', 'Gross margin = (sales − cost of cups sold) ÷ sales: the money left to pay fixed costs and make profit.',
+    'Cost of cups sold is lemons, sugar, ice and cups used. Recipe and price together set the gross margin.',
+    k.grossMargin == null ? null : { calc: 'Gross margin = (sales − cost of cups sold) ÷ sales = (' + M(rev) + ' − ' + M(cogsT) + ') ÷ ' + M(rev) + ' = ' + P(k.grossMargin) + '.', s: k.grossMargin / 0.6, good: k.grossMargin >= 0.45 ? 'A healthy gross margin of ' + P(k.grossMargin) + '.' : '',
+      bad: k.grossMargin < 0.45 ? 'Gross margin was only ' + P(k.grossMargin) + ': ingredients took too much of each sale.' : '',
+      tip: 'Use the cheapest recipe that keeps taste above 80, and avoid pricing below the fair price for the weather.' });
+  add('Finance and accounting', 'Contribution margin per cup', 'Contribution = price − variable cost per cup. Each cup sold contributes this amount towards fixed costs.',
+    'Your average price was ' + M(k.avgPrice) + ' and each cup cost ' + M(k.costPerCup) + ' in ingredients.',
+    k.contribution == null ? null : { calc: 'Contribution = average price − cost per cup = ' + M(k.avgPrice) + ' − ' + M(k.costPerCup) + ' = ' + M(k.contribution) + ' (' + P(k.contribution / k.avgPrice) + ' of price).', s: (k.contribution / k.avgPrice) / 0.7, good: k.contribution / k.avgPrice >= 0.5 ? 'Each cup contributed ' + M(k.contribution) + ' (' + P(k.contribution / k.avgPrice) + ' of its price).' : '',
+      bad: k.contribution / k.avgPrice < 0.5 ? 'Each cup contributed only ' + M(k.contribution) + ', ' + P(k.contribution / k.avgPrice) + ' of its price.' : '',
+      tip: 'Raise contribution by trimming lemons or sugar by one where taste stays high, or by raising price on busy days.' });
+  var beHits = O.filter(function (d) { return d.sv > 0; }).map(function (d) {
+    var c = d.sv ? (d.rev - d.cogs) / d.sv : 0, fx = d.fee + d.ad + (d.wg || 0) + (d.in || 0) + (d.lf || 0); return c > 0 ? d.sv >= fx / c : false; });
+  add('Finance and accounting', 'Break-even analysis', 'Break-even volume = fixed costs ÷ contribution per cup: the cups you must sell before making any profit.',
+    'Fixed costs each day are the stand fee, advertising, any helper wage and interest. The planning screen shows the break-even cups.',
+    beHits.length ? { calc: 'Average fixed cost a day ' + M(fixedAvg) + ' ÷ contribution ' + M(k.contribution) + ' = ' + (k.contribution > 0 ? Math.ceil(fixedAvg / k.contribution) : '—') + ' cups to break even; you sold ' + Math.round(k.avgCups) + ' a day on average. Above break-even on ' + of(beHits.filter(function (x) { return x; }).length, beHits.length) + '.', s: share(beHits, function (x) { return x; }), good: share(beHits, function (x) { return x; }) >= 0.7 ? 'You sold above break-even on ' + P(share(beHits, function (x) { return x; })) + ' of open days.' : '',
+      bad: share(beHits, function (x) { return x; }) < 0.7 ? 'You sold below break-even on ' + P(1 - share(beHits, function (x) { return x; })) + ' of open days.' : '',
+      tip: 'Check the break-even number before opening; if the forecast crowd is smaller, cut advertising or the helper that day.' } : null);
+  var lowCash = share(days, function (d) { return d.cash < 1000; });
+  add('Finance and accounting', 'Working capital and liquidity', 'Working capital is the cash needed to run day to day. Running out of cash stops a business even when it is profitable.',
+    'Cash pays for tomorrow\'s stock. The stand closes if cash cannot buy a full pitcher.',
+    { calc: 'Days with cash below ' + M(1000) + ': ' + of(days.filter(function (d) { return d.cash < 1000; }).length, days.length) + ' = ' + P(lowCash) + '. Score = 100 − that share.', s: 1 - lowCash, good: lowCash < 0.2 ? 'You kept a cash cushion on ' + P(1 - lowCash) + ' of days (lowest cash ' + M(Math.min.apply(null, days.map(function (d) { return d.cash; }))) + ').' : '',
+      bad: lowCash >= 0.2 ? 'Cash fell below ' + M(1000) + ' on ' + P(lowCash) + ' of days, leaving no buffer for bad weather.' : '',
+      tip: 'Keep at least one day\'s stock money in reserve before buying upgrades or advertising.' });
+  var borrowed = days.some(function (d) { return d.loan > 0; }), debtCost = k.interest + sum(days, function (d) { return d.lf || 0; }), intRatio = rev > 0 ? debtCost / rev : 0;
+  add('Finance and accounting', 'Cost of debt and leverage', 'Leverage is using borrowed money. It helps only when the return beats the interest cost.',
+    'Family loan fee, bank interest (2% a day) and the moneylender (20% a day) all appear as costs in the P&L.',
+    !borrowed ? null : { calc: 'Borrowing cost ÷ sales = (interest ' + M(k.interest) + ' + loan fees ' + M(debtCost - k.interest) + ') ÷ ' + M(rev) + ' = ' + P(intRatio) + '. Days with a loan: ' + P(k.loanDays) + '.', s: 1 - intRatio / 0.3, good: intRatio < 0.1 ? 'Borrowing costs (interest and fees) took only ' + P(intRatio) + ' of sales (' + M(debtCost) + ').' : '',
+      bad: intRatio >= 0.1 ? 'Borrowing costs (interest and fees) took ' + P(intRatio) + ' of sales (' + M(debtCost) + '); loans were on ' + P(k.loanDays) + ' of days.' : '',
+      tip: 'Borrow only for something that raises profit by more than the interest, and repay the most expensive loan first.' });
+  var raju = days.some(function (d) { return d.rj > 0; }), bank = days.some(function (d) { return d.bk > 0; });
+  add('Finance and accounting', 'Choice of lender (cost of capital)', 'Different sources of money have different costs: family, bank, moneylender and equity investors.',
+    'Family loans are cheap, the bank needs collateral and an EMI, and Raju charges 20% a day, compounding.',
+    !borrowed ? null : { calc: 'Sources used: ' + [days.some(function (d) { return d.loan > (d.bk || 0) + (d.rj || 0); }) ? 'family' : '', bank ? 'bank (2% a day)' : '', raju ? 'moneylender (20% a day)' : ''].filter(Boolean).join(', ') + '. Moneylender cost: ₹5,000 × 1.2⁵ = ₹12,442 after 5 days.', s: raju ? 0.3 : bank ? 0.8 : 0.9, good: !raju ? 'You avoided the moneylender and used cheaper money' + (bank ? ' from the bank.' : ' from family.') : '',
+      bad: raju ? 'You borrowed from Raju at 20% a day: a ₹5,000 loan grows to about ₹12,400 in 5 days.' : '',
+      tip: 'Compare the daily cost of each source on the Money screen before borrowing; never use the moneylender for routine stock.' });
+  var seized = days.some(function (d) { return d.sz > 0; });
+  add('Finance and accounting', 'Debt servicing and default risk', 'Lenders recover what they are owed from collateral; missing payments leads to seizure and, at worst, insolvency.',
+    'Five missed bank EMIs and the bank sells your equipment; an unpaid moneylender breaks the stall.',
+    !borrowed ? null : { calc: 'Equipment lost to lenders: ' + M(sum(days, function (d) { return d.sz || 0; })) + '.', s: seized ? 0 : 0.9, good: !seized ? 'You kept up with your loan payments and never lost equipment.' : '',
+      bad: seized ? 'You lost equipment to a lender (' + M(sum(days, function (d) { return d.sz || 0; })) + ' written off).' : '',
+      tip: 'Before borrowing, check that a normal day\'s profit covers the EMI at least 1.5 times (interest coverage).' });
+  var g = growth / Math.max(Math.abs(startNW), 1000);
+  add('Finance and accounting', 'Wealth creation (net worth and retained earnings)', 'Net worth = assets − liabilities. Growing it through retained profit is the real measure of a business.',
+    'Statistics shows the balance sheet: cash, stock and equipment less all loans.',
+    { calc: 'Net worth now ' + M(last.nw) + ' − at the start ' + M(startNW) + ' = ' + M(growth) + ' (' + P(g) + ' growth).', s: 0.5 + 0.5 * Math.max(-1, Math.min(1, g)), good: growth > 0 ? 'Net worth grew by ' + M(growth) + ' over the period.' : '',
+      bad: growth <= 0 ? 'Net worth fell by ' + M(-growth) + ' over the period.' : '',
+      tip: 'Judge each decision by its effect on net worth, not just on cash today.' });
+
+  // Tax planning (new in grading v2): on each weekly tax day, was a day's stock money still left in cash after the tax?
+  var taxD = days.filter(function (d) { return d.tx > 0; });
+  if (taxD.length) {
+    var need = avg(O, function (d) { return d.pur || 0; }) || 1, okTax = taxD.filter(function (d) { return d.cash >= need; }).length;
+    add('Finance and accounting', 'Taxation and tax planning', 'Tax planning means setting aside cash for tax when it falls due, and treating tax as a normal cost of earning profit.',
+      'Every seventh day 10% of the week\'s profit is taken as tax.',
+      { calc: 'Tax days: ' + taxD.length + '; tax paid ' + M(sum(taxD, function (d) { return d.tx; })) + '. Days that still left a day\'s stock money (' + M(need) + ') in cash: ' + okTax + ' of ' + taxD.length + '.', s: okTax / taxD.length,
+        good: okTax === taxD.length ? 'You always had stock money left after paying the weekly tax.' : '', bad: okTax < taxD.length ? 'On ' + (taxD.length - okTax) + ' tax days the tax left too little cash for the next day\'s stock.' : '',
+        tip: 'Keep about 10% of each day\'s profit aside for the weekly tax.' });
+  } else add('Finance and accounting', 'Taxation and tax planning', '', '', null);
+
+  /* --- Operations and supply chain --- */
+  var mt = O.filter(function (d) { return d.by > 0; }).map(function (d) { var made = d.sv + d.wp; return made && d.by ? Math.min(made, d.by) / Math.max(made, d.by) : 0; });
+  add('Operations and supply chain', 'Production planning (matching supply to demand)', 'Make enough to meet demand without overproducing. The gap in either direction costs money.',
+    'Pitchers made each day set the cups available; buyers depend on weather, price and reputation.',
+    mt.length ? { calc: 'For each day: smaller of (cups made, buyers) ÷ larger. Average over ' + of(mt.length, N) + ' = ' + P(avg(mt, function (x) { return x; })) + '. Over-made on ' + P(k.overMadeDays) + ' of days.', s: avg(mt, function (x) { return x; }), good: avg(mt, function (x) { return x; }) >= 0.75 ? 'Cups made matched buyers well (' + P(avg(mt, function (x) { return x; })) + ' match on average).' : '',
+      bad: avg(mt, function (x) { return x; }) < 0.75 ? 'Cups made and buyers were often far apart (' + P(avg(mt, function (x) { return x; })) + ' match).' : '',
+      tip: 'Use the forecast\'s expected buyers on the planning screen to decide pitchers, not yesterday\'s sales.' } : null);
+  add('Operations and supply chain', 'Inventory control and waste', 'Holding too much stock ties up cash and, for perishables, turns into waste.',
+    'Unsold lemonade is poured away and old lemons spoil; both are shown as waste in the P&L.',
+    k.waste == null ? null : { calc: 'Waste ÷ (ingredients used + waste) = ' + M(wsT) + ' ÷ ' + M(cogsT + wsT) + ' = ' + P(k.waste) + '.', s: 1 - k.waste / 0.3, good: k.waste < 0.1 ? 'Waste was low: ' + P(k.waste) + ' of ingredient cost.' : '',
+      bad: k.waste >= 0.1 ? P(k.waste) + ' of ingredient cost was thrown away.' : '', tip: 'Buy lemons for the next two or three days only, and make one pitcher less on uncertain days.' });
+  add('Operations and supply chain', 'Capacity and stock-outs', 'A stock-out loses sales and customer goodwill; capacity limits how many customers you can serve.',
+    'Customers are turned away when cups run out or the counter reaches its limit.',
+    { calc: 'Days customers were turned away: ' + of(O.filter(function (d) { return d.ta > 0; }).length, N) + ' = ' + P(k.stockOutDays) + '. Buyers lost: ' + taT + ' of ' + byT + ' = ' + P(byT ? taT / byT : 0) + '.', s: 1 - k.stockOutDays, good: k.stockOutDays < 0.2 ? 'You rarely ran out (' + P(k.stockOutDays) + ' of days).' : '',
+      bad: k.stockOutDays >= 0.2 ? 'You turned customers away on ' + P(k.stockOutDays) + ' of days (' + P(k.lostSales || 0) + ' of buyers lost).' : '',
+      tip: 'On hot and sunny forecasts keep a little safety stock, or invest in a faster counter or helper.' });
+  var spoil = sum(O, function (d) { return d.sp; }), ingred = sum(O, function (d) { return d.cogs + d.wst + d.sp; });
+  add('Operations and supply chain', 'Perishable goods (spoilage)', 'Perishable inventory loses value with time; first-in first-out and small orders reduce spoilage.',
+    'Lemons spoil after a few days and ice melts overnight.',
+    ingred > 0 ? { calc: 'Spoiled ÷ all ingredients bought = ' + M(spoil) + ' ÷ ' + M(ingred) + ' = ' + P(spoil / ingred) + '.', s: 1 - (spoil / ingred) / 0.15, good: spoil / ingred < 0.05 ? 'Almost nothing spoiled (' + P(spoil / ingred) + ').' : '',
+      bad: spoil / ingred >= 0.05 ? P(spoil / ingred) + ' of ingredients spoiled before use (' + M(spoil) + ').' : '', tip: 'Buy ice daily and lemons in smaller lots; use older stock first.' } : null);
+  var tsd = Math.sqrt(avg(O, function (d) { return (d.tas - k.taste) * (d.tas - k.taste); }));
+  add('Operations and supply chain', 'Product quality', 'Quality drives repeat customers and reputation; it must be managed, not left to chance.',
+    'Taste (0–100) comes from the lemon and sugar balance and ice for the weather.',
+    { calc: 'Average taste over ' + N + ' open days = ' + Math.round(k.taste) + ' out of 100.', s: k.taste / 100, good: k.taste >= 80 ? 'Average taste ' + Math.round(k.taste) + ': customers liked the product.' : '',
+      bad: k.taste < 80 ? 'Average taste only ' + Math.round(k.taste) + ', which holds back reputation.' : '', tip: 'Test recipes on the Recipe tab until taste shows 80 or more, then keep that recipe.' });
+  add('Operations and supply chain', 'Process consistency', 'Consistent processes give predictable quality (standard operating procedures).',
+    'How much your taste score varied from day to day.',
+    O.length >= 3 ? { calc: 'Standard deviation of daily taste = ±' + Math.round(tsd) + ' points (score falls to 0 at ±20).', s: 1 - tsd / 20, good: tsd < 8 ? 'Quality was steady day to day (variation ±' + Math.round(tsd) + ').' : '',
+      bad: tsd >= 8 ? 'Quality swung a lot from day to day (±' + Math.round(tsd) + ' points).' : '', tip: 'Fix a standard recipe and change only the ice with the weather.' } : null);
+  var disc = O.filter(function (d) { return d.ev === 'discount'; }), other = O.filter(function (d) { return d.ev !== 'discount' && d.ev !== 'shortage'; });
+  add('Operations and supply chain', 'Purchasing and supplier deals', 'Good buyers stock up when prices are low and buy only what they need when prices are high.',
+    'Supplier discounts (25% off) and shortages (40% dearer) change the price of every pack.',
+    disc.length && other.length ? (function () { var r = avg(disc, function (d) { return d.pur; }) / Math.max(1, avg(other, function (d) { return d.pur; }));
+      return { calc: 'Average buying on discount days ' + M(avg(disc, function (d) { return d.pur; })) + ' ÷ on normal days ' + M(avg(other, function (d) { return d.pur; })) + ' = ' + r.toFixed(1) + '×.', s: r / 2, good: r >= 1.3 ? 'You bought ' + r.toFixed(1) + '× more than usual on discount days.' : '', bad: r < 1.3 ? 'You did not stock up on discount days (' + r.toFixed(1) + '× usual buying).' : '',
+        tip: 'On a supplier discount, buy non-perishables (sugar, cups) for several days ahead.' }; })() : null);
+
+  /* --- Marketing and pricing --- */
+  var pr = avg(O, function (d) { return d.pr / fair(d); });
+  add('Marketing and pricing', 'Value-based pricing', 'Price should reflect what customers are willing to pay, not just cost.',
+    'Customers judge your price against a fair price that rises on hot days and falls on cool and rainy days.',
+    { calc: 'Average of (your price ÷ fair price for the forecast) = ' + P(pr) + '. Fair price = ' + M(100) + ' × weather factor (hot 1.2, sunny 1.0, cloudy 0.95, cool and rainy 0.85, stormy 0.8). Best near 105%.', s: 1 - Math.abs(pr - 1.05) / 0.5, good: Math.abs(pr - 1.05) <= 0.15 ? 'Your prices sat close to what customers expect (' + P(pr) + ' of the fair price).' : '',
+      bad: Math.abs(pr - 1.05) > 0.15 ? 'Your average price was ' + P(pr) + ' of the fair price: ' + (pr > 1.05 ? 'too high, so fewer people bought.' : 'too low, leaving money on the table.') : '',
+      tip: 'Start near the fair price shown in "What today looks like" and adjust in small steps.' });
+  var pc = corr(O.map(function (d) { return [d.pr, fair(d)]; })), prices = Object.keys(O.reduce(function (a, d) { a[d.pr] = 1; return a; }, {})).length;
+  add('Marketing and pricing', 'Dynamic pricing (responding to demand)', 'Changing price with demand (weather, events) captures more value on busy days.',
+    'Fair price changes with the weather; a good manager follows it.',
+    { calc: (pc == null ? 'Distinct prices used: ' + prices + '.' : 'Correlation between your price and the fair price over ' + N + ' days = ' + pc.toFixed(2) + ' (1 = follows the weather exactly).'), s: pc == null ? (prices > 1 ? 0.4 : 0.2) : 0.5 + 0.5 * pc, good: pc != null && pc > 0.4 ? 'Your price rose and fell with the weather (correlation ' + pc.toFixed(2) + ').' : '',
+      bad: pc == null || pc <= 0.4 ? (prices <= 1 ? 'You kept one price every day, whatever the weather.' : 'Your price changes did not follow the weather.') : '',
+      tip: 'Raise price 10–20% on hot days and lower it on cool or rainy days.' });
+  add('Marketing and pricing', 'Price experimentation and elasticity', 'Price elasticity measures how buyers respond to price; you learn it by testing prices.',
+    'Each price you try shows how many passers-by bought.',
+    { calc: 'Prices tried: ' + prices + '. ' + (k.elasticity != null ? 'Elasticity = slope of ln(conversion) on ln(price) = ' + k.elasticity.toFixed(2) + '.' : 'Elasticity needs 5+ days with at least 2 different prices.'), s: k.elasticity != null ? 0.85 : Math.min(1, prices / 5), good: k.elasticity != null ? 'You tested enough prices to measure elasticity (' + k.elasticity.toFixed(2) + ': ' + (k.elasticity < -1 ? 'customers are price-sensitive' : 'customers are not very price-sensitive') + ').' : '',
+      bad: k.elasticity == null ? 'You tried only ' + prices + ' price' + (prices === 1 ? '' : 's') + ', too few to learn how customers react.' : '', tip: 'Try at least three different prices on similar weather days and compare the conversion rate.' });
+  add('Marketing and pricing', 'Conversion rate', 'Conversion = buyers ÷ people reached. It reflects price, product and reputation together.',
+    'Passers-by become buyers depending on price, taste and reputation.',
+    k.conversion == null ? null : { calc: 'Buyers ÷ passers-by = ' + byT + ' ÷ ' + pbT + ' = ' + P(k.conversion) + '.', s: k.conversion / 0.5, good: k.conversion >= 0.35 ? P(k.conversion) + ' of passers-by bought: a strong offer.' : '',
+      bad: k.conversion < 0.35 ? 'Only ' + P(k.conversion) + ' of passers-by bought.' : '', tip: 'Lift conversion with better taste first, then a fair price; advertising brings people but does not convince them.' });
+  var adD = O.filter(function (d) { return d.ad > 0; });
+  add('Marketing and pricing', 'Marketing return on investment', 'Marketing ROI = extra profit from advertising ÷ advertising cost. Spend should be tested and measured.',
+    'Advertising raises the number of passers-by at a daily cost.',
+    { calc: (k.adReturn == null ? 'Advertising days: ' + adD.length + ' (needs 2+ days with and 2+ without ads).' : '(profit + ad cost on ad days ' + M(avg(adD, function (d) { return d.np + d.ad; })) + ' − profit on other days ' + M(avg(O.filter(function (d) { return !d.ad; }), function (d) { return d.np; })) + ') ÷ average ad spend ' + M(avg(adD, function (d) { return d.ad; })) + ' = ' + k.adReturn.toFixed(1) + '×.'), s: k.adReturn == null ? (adD.length ? 0.5 : 0.4) : k.adReturn, good: k.adReturn != null && k.adReturn >= 1 ? 'Advertising paid for itself (' + k.adReturn.toFixed(1) + '× return).' : '',
+      bad: k.adReturn == null ? (adD.length ? 'You advertised too rarely to measure the return.' : 'You never tested advertising.') : k.adReturn < 1 ? 'Advertising returned only ' + k.adReturn.toFixed(1) + '× its cost.' : '',
+      tip: 'Advertise on hot and sunny days when many people pass, and compare profit with similar days without ads.' });
+  var goodWx = sum(adD.filter(function (d) { return d.f === 'hot' || d.f === 'sunny'; }), function (d) { return d.ad; }), allAd = sum(adD, function (d) { return d.ad; });
+  add('Marketing and pricing', 'Targeting marketing spend', 'Spend marketing where and when it reaches the most likely buyers.',
+    'Ads work best when the forecast brings crowds (hot and sunny days).',
+    allAd ? { calc: 'Ad spend on hot and sunny days ' + M(goodWx) + ' ÷ all ad spend ' + M(allAd) + ' = ' + P(goodWx / allAd) + '.', s: goodWx / allAd, good: goodWx / allAd >= 0.7 ? P(goodWx / allAd) + ' of ad spend went on hot and sunny days.' : '',
+      bad: goodWx / allAd < 0.7 ? P(1 - goodWx / allAd) + ' of ad spend went on cloudy, cool or rainy days when few people pass.' : '', tip: 'Switch advertising off when the forecast is cool, rainy or stormy.' } : null);
+  var pink = O.filter(function (d) { return d.pd && d.pd !== 'classic'; }), classic = O.filter(function (d) { return !d.pd || d.pd === 'classic'; });
+  add('Marketing and pricing', 'Product differentiation', 'Offering a distinct premium product lets you charge more to customers who value it.',
+    'Pink lemonade is a premium variant with its own cost and price.',
+    pink.length && classic.length ? (function () { var b = avg(pink, function (d) { return d.np; }) > avg(classic, function (d) { return d.np; });
+      return { calc: 'Average daily profit: premium ' + M(avg(pink, function (d) { return d.np; })) + ' (' + pink.length + ' days) vs classic ' + M(avg(classic, function (d) { return d.np; })) + ' (' + classic.length + ' days).', s: b ? 0.9 : 0.5, good: b ? 'Your premium product earned more per day (' + M(avg(pink, function (d) { return d.np; })) + ' vs ' + M(avg(classic, function (d) { return d.np; })) + ').' : '',
+        bad: !b ? 'The premium product earned less than classic on your days (' + M(avg(pink, function (d) { return d.np; })) + ' vs ' + M(avg(classic, function (d) { return d.np; })) + ').' : '', tip: 'Price a premium product clearly above classic, and sell it on busy days.' }; })() : null);
+  var repCh = last.rep - (first.rep - (first.rd || 0));
+  add('Marketing and pricing', 'Brand equity and reputation', 'Reputation is an asset built by consistent quality and fair prices; it brings future customers.',
+    'Reputation (0–100) rises with happy customers and falls with poor taste, high prices or being closed.',
+    { calc: 'Reputation now ' + last.rep + ' − at the start ' + (first.rep - (first.rd || 0)) + ' = ' + (repCh >= 0 ? '+' : '') + repCh + ' points.', s: 0.5 + repCh / 40, good: repCh > 0 ? 'Reputation rose by ' + repCh + ' points to ' + last.rep + '.' : '', bad: repCh <= 0 ? 'Reputation ' + (repCh < 0 ? 'fell by ' + (-repCh) : 'did not grow') + ' (now ' + last.rep + ').' : '',
+      tip: 'Avoid turning customers away and keep taste high; reputation compounds over time.' });
+
+  /* --- Economics and decision-making --- */
+  var iceHit = share(O, function (d) { return d.ic === (WX[d.f] || [0, d.ic])[1]; });
+  add('Economics and decision-making', 'Using forecasts (decisions under uncertainty)', 'Good managers act on the best available information, even when it is uncertain.',
+    'The weather forecast tells you the ideal ice per cup and the likely crowd.',
+    { calc: 'Days ice matched the forecast ideal: ' + of(O.filter(function (d) { return d.ic === (WX[d.f] || [0, d.ic])[1]; }).length, N) + ' = ' + P(iceHit) + '.', s: iceHit, good: iceHit >= 0.6 ? 'Ice matched the forecast on ' + P(iceHit) + ' of days.' : '', bad: iceHit < 0.6 ? 'Ice matched the forecast on only ' + P(iceHit) + ' of days.' : '',
+      tip: 'Read the forecast first each day and set ice to the ideal shown (4 hot, 3 sunny, 2 cloudy, 1 otherwise).' });
+  var stormF = days.filter(function (d) { return d.f === 'stormy'; });
+  add('Economics and decision-making', 'Risk management', 'Reduce exposure when the downside is large: scale down, insure or stay out.',
+    'Rainy and stormy days bring few customers; closing or making less limits losses.',
+    k.badWeatherProfit == null && !stormF.length ? null : { calc: 'Average profit on rainy and stormy days: ' + (k.badWeatherProfit == null ? 'none open' : M(k.badWeatherProfit)) + '. Storm forecasts closed: ' + stormF.filter(function (d) { return d.cl; }).length + ' of ' + stormF.length + '.', s: (k.badWeatherProfit == null || k.badWeatherProfit >= 0 ? 0.6 : 0.2) + (stormF.length ? 0.4 * share(stormF, function (d) { return d.cl; }) : 0.3),
+      good: k.badWeatherProfit != null && k.badWeatherProfit >= 0 ? 'You did not lose money on rainy or stormy days.' : stormF.length && share(stormF, function (d) { return d.cl; }) > 0.5 ? 'You closed on most storm forecasts.' : '',
+      bad: k.badWeatherProfit != null && k.badWeatherProfit < 0 ? 'Rainy and stormy days lost ' + M(-k.badWeatherProfit) + ' each on average.' : '',
+      tip: 'On rainy forecasts make one pitcher and skip ads; close for storms.' });
+  add('Economics and decision-making', 'Loss aversion (behavioural bias)', 'People react more strongly to losses than gains, often cutting price in panic after a bad day.',
+    'How often you cut the price the day after a loss.',
+    k.cutAfterLoss == null ? null : { calc: 'Price cut the day after a loss: ' + P(k.cutAfterLoss) + ' of loss days (a balanced manager is near 40%).', s: 1 - Math.abs(k.cutAfterLoss - 0.4) / 0.6, good: k.cutAfterLoss <= 0.6 ? 'After losses you reacted calmly (price cut on ' + P(k.cutAfterLoss) + ' of them).' : '',
+      bad: k.cutAfterLoss > 0.6 ? 'You cut the price after ' + P(k.cutAfterLoss) + ' of losing days.' : '', tip: 'After a loss, find the cause first (weather, waste, stock-out) before touching the price.' });
+  add('Economics and decision-making', 'Learning curve', 'Performance should improve with experience as you learn from results.',
+    'Average daily profit in your first week compared with your latest week.',
+    k.first7 == null ? null : (function () { var gg = (k.last7 - k.first7) / Math.max(Math.abs(k.first7), 100);
+      return { calc: 'Average daily profit, days 1–7: ' + M(k.first7) + '; latest 7 days: ' + M(k.last7) + '. Change = (' + M(k.last7) + ' − ' + M(k.first7) + ') ÷ ' + M(Math.max(Math.abs(k.first7), 100)) + ' = ' + P(gg) + '.', s: 0.5 + 0.5 * Math.max(-1, Math.min(1, gg)), good: gg > 0.1 ? 'Daily profit rose from ' + M(k.first7) + ' to ' + M(k.last7) + '.' : '', bad: gg <= 0.1 ? 'Daily profit went from ' + M(k.first7) + ' to ' + M(k.last7) + ', no clear improvement.' : '',
+        tip: 'Change one thing at a time and read the insight on each results screen.' }; })());
+  var comp = O.filter(function (d) { return d.ev === 'competitor'; }), nonComp = O.filter(function (d) { return d.ev !== 'competitor'; });
+  add('Strategy and growth', 'Competitive response', 'When a rival enters, respond with price, quality or service to protect market share.',
+    'A rival stand sells about 10% below the fair price and takes customers unless you respond.',
+    comp.length && nonComp.length ? (function () { var r = avg(comp, function (d) { return d.pr / fair(d); }) / avg(nonComp, function (d) { return d.pr / fair(d); });
+      return { calc: 'Your price ÷ fair price on rival days ' + P(avg(comp, function (d) { return d.pr / fair(d); })) + ' vs other days ' + P(avg(nonComp, function (d) { return d.pr / fair(d); })) + ' (ratio ' + r.toFixed(2) + ').', s: r <= 0.95 ? 0.9 : r <= 1.02 ? 0.6 : 0.3, good: r <= 0.95 ? 'You priced sharper when the rival appeared.' : '', bad: r > 0.95 ? 'You did not adjust your price when the rival appeared.' : '',
+        tip: 'On rival days price at or just below the rival\'s price shown on the forecast card.' }; })() : null);
+
+  // Responding to market events (new in grading v2): busy events need more stock (serve more, turn few away);
+  // slow events need lower costs (no advertising, small or no loss).
+  var BUSY = { festival: 1, sports: 1, holiday: 1 }, SLOW = { closure: 1, competitor: 1 };
+  var evD = O.filter(function (d) { return BUSY[d.ev] || SLOW[d.ev]; }), plain = O.filter(function (d) { return !d.ev; });
+  if (evD.length) {
+    var base = function (d) { var same = plain.filter(function (x) { return x.w === d.w; }); return same.length ? avg(same, function (x) { return x.sv; }) : avg(plain, function (x) { return x.sv; }); };
+    var evS = evD.map(function (d) {
+      if (BUSY[d.ev]) { var b = base(d) || 1; return 0.6 * cl((d.sv / b - 1) / 0.3) + 0.4 * (d.by ? 1 - cl(d.ta / d.by / 0.2) : 1); }
+      return (d.ad ? 0 : 0.5) + (d.np >= 0 ? 0.5 : 0.2);
+    });
+    var busyN = evD.filter(function (d) { return BUSY[d.ev]; }).length;
+    add('Economics and decision-making', 'Responding to market events', 'Responding to market events means adjusting stock, price and spending when conditions change suddenly.',
+      'Festivals, cricket matches and holidays bring more people; road closures and a rival\'s promotion bring fewer.',
+      { calc: 'Event days: ' + evD.length + ' (' + busyN + ' busy, ' + (evD.length - busyN) + ' slow). Busy days: served more than a normal day of the same weather and turned few away; slow days: no advertising and no big loss. Average response score ' + P(avg(evS, function (x) { return x; })) + '.', s: avg(evS, function (x) { return x; }),
+        good: avg(evS, function (x) { return x; }) >= 0.7 ? 'You read market events well and adjusted on the day.' : '', bad: avg(evS, function (x) { return x; }) < 0.5 ? 'You often ran event days like normal days.' : '',
+        tip: 'On a festival or match day make more pitchers and price a little higher; on a closure day cut advertising and stock.' });
+  } else add('Economics and decision-making', 'Responding to market events', '', '', null);
+
+  /* --- Strategy and growth --- */
+  var ups = Math.max.apply(null, days.map(function (d) { return d.up || 0; })), tier = Math.max.apply(null, days.map(function (d) { return d.tier || 1; }));
+  add('Strategy and growth', 'Capital investment decisions', 'Investing in assets raises future capacity or quality; the payback period tells you if it is worth it.',
+    'Upgrades cost money now and raise taste, capacity or traffic; each shows its payback days.',
+    { calc: 'Upgrades owned at the end: ' + ups + '. Score = 40 + 20 per upgrade (20 with none).', s: ups ? Math.min(1, 0.4 + ups * 0.2) : 0.2, good: ups ? 'You invested in ' + ups + ' upgrade' + (ups > 1 ? 's' : '') + '.' : '', bad: !ups ? 'You made no investments in equipment.' : '',
+      tip: 'Buy the upgrade with the shortest payback first, once you keep a cash reserve.' });
+  add('Strategy and growth', 'Business growth and scale', 'Growing to a larger format raises fixed costs but also capacity and revenue (economies of scale).',
+    'Moving up a stand tier needs enough profit and cash.',
+    { calc: 'Highest stand tier reached: ' + tier + '; net worth change ' + M(growth) + '.', s: tier > 1 ? 1 : growth > 0 ? 0.5 : 0.2, good: tier > 1 ? 'You grew to tier ' + tier + '.' : '', bad: tier === 1 ? 'You stayed at the first tier.' : '', tip: 'Build cash and profit steadily; the Grow option appears when you qualify.' });
+  var iv = sum(days, function (d) { return d.iv || 0; });
+  add('Strategy and growth', 'Equity financing and dilution', 'Selling a share of the business brings money without repayment, but gives away part of every future profit.',
+    'The angel investor offers money for 30% of profits; you can buy the stake back.',
+    iv > 0 ? { calc: 'Investor\'s 30% share paid so far: ' + M(iv) + '.', s: 0.7, good: 'You raised equity instead of debt.', bad: 'The investor has taken ' + M(iv) + ' so far as their share.', tip: 'Buy the stake back once profits are steady; dilution is permanent otherwise.' } : null);
+  // Timing of expansion: profit in the five days after moving up a tier vs the five days before
+  var tu = -1; days.forEach(function (d, i) { if (tu < 0 && i > 0 && (d.tier || 1) > (days[i - 1].tier || 1)) tu = i; });
+  add('Strategy and growth', 'Timing of expansion', 'Expand when demand and cash can carry the higher fixed costs; too early strains cash, too late leaves money on the table.',
+    'Moving up a stand tier raises capacity and the daily fee.',
+    tu > 0 ? (function () { var bf = avg(days.slice(Math.max(0, tu - 5), tu), function (d) { return d.np; }), af = days.slice(tu, tu + 5), aa = avg(af, function (d) { return d.np; });
+      return { calc: 'Moved up on day ' + days[tu].d + '. Average profit 5 days before ' + M(bf) + ', after ' + M(aa) + ' (' + af.length + ' days).', s: aa >= bf ? 1 : aa > 0 ? 0.6 : 0.3,
+        good: aa >= bf ? 'Profit rose after you expanded.' : '', bad: aa < bf ? 'Profit fell after you expanded (' + M(bf) + ' → ' + M(aa) + ').' : '', tip: 'Expand going into good weather, with cash left for a few slow days.' }; })() : null);
+  // Return on investment: profit in the five days after each upgrade vs the five days before
+  var ui = []; days.forEach(function (d, i) { if (i > 0 && (d.up || 0) > (days[i - 1].up || 0)) ui.push(i); });
+  add('Strategy and growth', 'Return on investment (upgrades)', 'An investment is judged by what it adds to profit afterwards, not by what it costs.',
+    'Each upgrade should lift profit (more taste, capacity or traffic) in the days after you buy it.',
+    ui.length ? (function () { var up = ui.filter(function (i) { return avg(days.slice(i, i + 5), function (d) { return d.np; }) > avg(days.slice(Math.max(0, i - 5), i), function (d) { return d.np; }); }).length;
+      return { calc: 'Upgrades bought: ' + ui.length + ' (days ' + ui.map(function (i) { return days[i].d; }).join(', ') + '); profit was higher in the 5 days after ' + up + ' of them.', s: 0.3 + 0.7 * up / ui.length,
+        good: up ? up + ' of your ' + ui.length + ' upgrades were followed by higher profit.' : '', bad: up < ui.length ? (ui.length - up) + ' upgrade' + (ui.length - up > 1 ? 's were' : ' was') + ' followed by lower profit.' : '', tip: 'Buy the upgrade that fixes your biggest problem (stock-outs → counter, low taste → equipment).' }; })() : null);
+  // Sustainable growth: share of 5-day windows in which net worth rose
+  var win = []; for (var wi = 5; wi < days.length; wi++) win.push(days[wi].nw > days[wi - 5].nw);
+  add('Strategy and growth', 'Sustainable growth', 'Lasting businesses grow steadily rather than in bursts followed by losses.',
+    'Net worth should rise over most stretches of the game, not just overall.',
+    win.length ? { calc: 'Net worth rose over ' + win.filter(Boolean).length + ' of ' + win.length + ' five-day stretches = ' + P(share(win, function (x) { return x; })) + '.', s: share(win, function (x) { return x; }),
+      good: share(win, function (x) { return x; }) >= 0.7 ? 'Your net worth grew steadily.' : '', bad: share(win, function (x) { return x; }) < 0.7 ? 'Net worth fell over ' + win.filter(function (x) { return !x; }).length + ' of ' + win.length + ' stretches.' : '', tip: 'Protect the downside: smaller batches and lower costs on poor-weather days.' } : null);
+
+  // Scaling through stand tiers (new in grading v2): moved up when demand outgrew the stand, and used the new capacity.
+  var TIER_CAP = [60, 100, 150, 300, 500], tUp = days.findIndex(function (d, i) { return i > 0 && d.tier > days[i - 1].tier; });
+  if (tUp > 0) {
+    var aft = O.filter(function (d, i) { return d.d > days[tUp].d; }), cap = function (d) { return TIER_CAP[(d.tier || 1) - 1] || 60; };
+    var use = aft.length ? avg(aft, function (d) { return Math.min(1, d.sv / cap(d)); }) : 0, bef = days.slice(Math.max(0, tUp - 10), tUp), pressure = bef.length ? share(bef, function (d) { return d.ta > 0; }) : 0;
+    add('Strategy and growth', 'Scaling through stand tiers', 'Scaling through tiers means moving up to a bigger stand when demand outgrows the current one, and then using the new capacity.',
+      'Each stand tier serves more cups a day but charges a higher daily fee.',
+      { calc: 'Moved up to tier ' + days[tUp].tier + ' on day ' + days[tUp].d + '. Customers were turned away on ' + P(pressure) + ' of the 10 days before. Capacity used after moving: ' + P(use) + '.', s: 0.4 + 0.6 * cl(use / 0.7),
+        good: use >= 0.7 ? 'You filled the bigger stand: the move paid off.' : '', bad: use < 0.5 ? 'After moving up you used only ' + P(use) + ' of the bigger stand\'s capacity, so the higher fee was partly wasted.' : '',
+        tip: 'Move up when you turn customers away often, then use price and marketing to fill the extra capacity.' });
+  } else if (N >= 15 && k.stockOutDays > 0.3) {
+    add('Strategy and growth', 'Scaling through stand tiers', 'Scaling through tiers means moving up to a bigger stand when demand outgrows the current one.', 'Each stand tier serves more cups a day but charges a higher daily fee.',
+      { calc: 'Never moved up, while customers were turned away on ' + P(k.stockOutDays) + ' of days.', s: 0.3, good: '', bad: 'Demand outgrew your stand but you did not move up.', tip: 'When you often turn customers away, check whether you qualify for the next stand.' });
+  } else add('Strategy and growth', 'Scaling through stand tiers', '', '', null);
+
+  /* --- People --- */
+  var hd = O.filter(function (d) { return d.hp; }), nh = O.filter(function (d) { return !d.hp; });
+  var baseCap = function (d) { return [60, 60, 100, 150, 300, 500][d.tier || 1]; };
+  add('People and organisation', 'Workforce planning (staffing to demand)', 'Match staff to expected demand: extra hands on busy days, none on quiet ones.',
+    'A helper adds 40 cups of capacity; without one, busy days turn buyers away.',
+    (function () { var busy = function (d) { return d.f === 'hot' || d.f === 'sunny'; }, lost = nh.filter(function (d) { return d.ta > 0; }).length;
+      if (hd.length) { var fit = hd.filter(busy).length; return { calc: 'Helper on ' + hd.length + ' days, ' + fit + ' of them hot or sunny forecasts; buyers turned away without a helper on ' + of(lost, nh.length) + '.', s: 0.3 + 0.7 * fit / hd.length - (nh.length ? 0.3 * lost / nh.length : 0),
+        good: fit ? 'You used the helper on ' + fit + ' busy-forecast days.' : '', bad: fit < hd.length ? 'The helper worked ' + (hd.length - fit) + ' quiet-forecast days.' : '', tip: 'Hire for hot and sunny spells; let the helper go before cool or rainy days.' }; }
+      return { calc: 'No helper hired; buyers turned away on ' + of(lost, N) + '.', s: 1 - 1.5 * lost / N, good: !lost ? 'Your capacity was enough without extra staff.' : '',
+        bad: lost ? 'You turned buyers away on ' + lost + ' days without hiring help.' : '', tip: 'When you turn buyers away on busy days, a helper (₹300 a day) can pay for itself.' }; })());
+  var streak = 0, unhappy = 0; days.forEach(function (d) { if (d.hp && streak >= 3) unhappy++; streak = d.np < 0 ? streak + 1 : 0; });
+  add('People and organisation', 'Employee morale', 'Staff motivation falls after repeated failure; managers protect morale by avoiding long losing runs.',
+    'After three loss-making days in a row the helper gets unhappy and taste drops by 5.',
+    hd.length ? { calc: 'Helper days: ' + hd.length + '; days the helper worked after 3 or more losses in a row: ' + unhappy + '.', s: 1 - 2 * unhappy / hd.length,
+      good: !unhappy ? 'You never let the helper work through a losing streak.' : '', bad: unhappy ? 'The helper worked ' + unhappy + ' day' + (unhappy > 1 ? 's' : '') + ' while unhappy after a losing streak.' : '', tip: 'Break losing runs fast: cut costs, fix the price, or let the helper go.' } : null);
+  add('People and organisation', 'Labour productivity', 'Productivity is output per worker; extra staff only pay off if their capacity is used.',
+    'The helper\'s 40 extra cups count only on days when you serve more than the stand alone could.',
+    hd.length ? (function () { var used = avg(hd, function (d) { return cl((d.sv - baseCap(d)) / 40); });
+      return { calc: 'Average use of the helper\'s 40 extra cups on helper days = ' + P(used) + ' (cups served above the stand\'s own capacity).', s: used,
+        good: used >= 0.6 ? 'You made good use of the helper\'s extra capacity.' : '', bad: used < 0.6 ? 'Most of the helper\'s extra capacity went unused.' : '', tip: 'Keep the helper only when you expect to sell more than the stand can serve alone.' }; })() : null);
+  add('People and organisation', 'Fixed costs and operating leverage (hiring)', 'A wage is a fixed cost; it pays off only when extra sales cover it (operating leverage).',
+    'A helper costs a daily wage, adds capacity and gets unhappy after losing streaks.',
+    hd.length ? (function () { var b = !nh.length || avg(hd, function (d) { return d.np; }) >= avg(nh, function (d) { return d.np; });
+      return { calc: 'Average profit with the helper ' + M(avg(hd, function (d) { return d.np; })) + ' (' + hd.length + ' days) vs without ' + (nh.length ? M(avg(nh, function (d) { return d.np; })) + ' (' + nh.length + ' days)' : '—') + '; wage ' + M(600) + ' a day.', s: b ? 0.85 : 0.4, good: b ? 'Days with the helper earned ' + M(avg(hd, function (d) { return d.np; })) + ' on average' + (nh.length ? ' vs ' + M(avg(nh, function (d) { return d.np; })) + ' without.' : '.') : '',
+        bad: !b ? 'Days with the helper earned less (' + M(avg(hd, function (d) { return d.np; })) + ' vs ' + M(avg(nh, function (d) { return d.np; })) + ').' : '', tip: 'Hire help only for periods of high demand; let go when crowds are small.' }; })() : null);
+
+  /* --- Ethics and compliance --- */
+  var visits = days.filter(function (d) { return d.of; }), bribes = visits.filter(function (d) { return d.of === 'bribe'; }).length, permit = days.some(function (d) { return d.pm; });
+  add('Ethics and compliance', 'Regulatory compliance', 'Following the law (licences, permits) avoids fines, closures and reputational damage; compliance is an investment.',
+    'Without a Street Vending Permit the municipal officer visits; the permit stops the visits for good.',
+    visits.length || permit ? { calc: 'Officer visits: ' + visits.length + '; Street Vending Permit: ' + (permit ? 'yes' : 'no') + '.', s: permit ? 1 : 1 - (visits.length >= 3 ? 0.4 : 0.2), good: permit ? 'You bought the Street Vending Permit.' : '',
+      bad: !permit ? 'The officer visited ' + visits.length + ' time' + (visits.length > 1 ? 's' : '') + ' and you never bought the permit.' : '', tip: 'Buy the permit early: it costs less than two bribes or one fine.' } : null);
+  add('Ethics and compliance', 'Corruption as a recurring cost', 'A bribe is not a one-time fix: it creates an obligation that keeps coming back, and it is illegal.',
+    'Bribing the officer brings him back every second day for more.',
+    visits.length ? { calc: 'Bribes paid on ' + bribes + ' of ' + visits.length + ' visits = ' + P(bribes / visits.length) + '; total ' + M(sum(days, function (d) { return d.bb || 0; })) + '.', s: 1 - (bribes / visits.length) * 0.9, good: !bribes ? 'You never paid a bribe.' : '', bad: bribes ? 'You paid bribes on ' + bribes + ' of ' + visits.length + ' visits (' + M(sum(days, function (d) { return d.bb || 0; })) + ').' : '',
+      tip: 'Choose the legal route: pay the fine once and buy the permit.' } : null);
+  var paid = sum(days, function (d) { return (d.bb || 0) + (d.fi || 0); }), pIdx = -1; days.forEach(function (d, i) { if (pIdx < 0 && d.pm) pIdx = i; });
+  var before = pIdx < 0 ? visits.length : days.slice(0, pIdx).filter(function (d) { return d.of; }).length;
+  add('Ethics and compliance', 'Cost of compliance vs cost of non-compliance', 'Compare the one-time cost of doing it right with the repeated cost of fines and bribes.',
+    'The permit costs ' + M(4000) + ' once; each fine or bribe costs money every visit.',
+    visits.length || permit ? { calc: 'Paid in fines and bribes: ' + M(paid) + '; permit price ' + M(4000) + '; officer visits before the permit: ' + before + '.', s: permit ? 1 - 0.15 * before : paid > 4000 ? 0.15 : 0.45,
+      good: permit ? 'You bought the permit' + (before ? ' after ' + before + ' visit' + (before > 1 ? 's' : '') : ' before any visit') + '.' : '', bad: !permit ? 'You spent ' + M(paid) + ' on fines and bribes instead of a ' + M(4000) + ' permit.' : before > 1 ? 'You waited ' + before + ' visits before buying the permit.' : '',
+      tip: 'Buy the permit as soon as you can afford it: it pays for itself after about two visits.' } : null);
+  ['Market segmentation', 'Seasonal demand', 'Franchise model', 'Accounts payable'].forEach(function (n) { missing.push(n + ' (not in the game yet)'); });
+  return { list: out, missing: missing };
+}
+function conceptHtml(c) {
+  var bar = '<div style="font-size:6pt;line-height:6pt">' + hbar(c.m, GCOL[c.gr.g], 50) + '</div>';
+  return '<div style="border:1px solid #d1d5db;padding:6px 8px;margin:0 0 6px;page-break-inside:avoid"><table style="border:0"><tr><td style="border:0;padding:0"><b>' + e(c.name) + '</b></td><td style="border:0;padding:0;text-align:right;white-space:nowrap">Mark <b>' + c.m + '%</b> ' + gbadge(c.gr) + '</td></tr></table>' + bar +
+    '<div class="muted" style="margin-top:4px"><b>Concept:</b> ' + e(c.what) + '<br><b>In the game:</b> ' + e(c.applied) + '</div>' +
+    (c.calc ? '<div style="margin-top:3px;background:#f3f4f6;padding:3px 5px">🧮 <b>Calculation:</b> ' + e(c.calc) + ' Mark ' + c.m + '%, grade ' + c.gr.g + ' (' + c.gr.gp + ' points).</div>' : '') +
+    (c.good ? '<div style="margin-top:3px">✅ <b>What went well:</b> ' + e(c.good) + '</div>' : '') + (c.bad ? '<div style="margin-top:3px">⚠️ <b>What went wrong:</b> ' + e(c.bad) + '</div>' : '') +
+    '<div style="margin-top:3px">➡️ <b>How to improve:</b> ' + e(c.tip) + '</div></div>';
+}
+
+/* ---------- Scores: copied from the app (app/src/main/assets/www/js/journal.js). tests/run.js checks they match. ---------- */
+var SK = (function () {
+  function sum(a, f) { return a.reduce(function (s, x) { return s + f(x); }, 0); }
+  function avg(a, f) { return a.length ? sum(a, f) / a.length : 0; }
+  /* Least-squares slope of y on x. */
+  function slope(pts) {
+    if (pts.length < 2) return null;
+    var mx = avg(pts, function (p) { return p[0]; }), my = avg(pts, function (p) { return p[1]; });
+    var sxx = sum(pts, function (p) { return (p[0] - mx) * (p[0] - mx); });
+    if (sxx < 1e-9) return null;
+    return sum(pts, function (p) { return (p[0] - mx) * (p[1] - my); }) / sxx;
+  }
+
+  function kpis(days) {
+    var open = days.filter(function (d) { return !d.cl; });
+    var k = { days: days.length, open: open.length };
+    if (!open.length) return k;
+    k.profit = sum(days, function (d) { return d.np; });
+    k.avgProfit = k.profit / days.length;
+    k.profitableShare = days.filter(function (d) { return d.np > 0; }).length / days.length;
+    var rev = sum(open, function (d) { return d.rev; }), cogs = sum(open, function (d) { return d.cogs; }), sv = sum(open, function (d) { return d.sv; });
+    k.grossMargin = rev > 0 ? (rev - cogs) / rev : null;
+    k.avgPrice = sv > 0 ? rev / sv : null;
+    k.costPerCup = sv > 0 ? cogs / sv : null;
+    k.contribution = k.avgPrice != null ? k.avgPrice - k.costPerCup : null;
+    var fixed = avg(open, function (d) { return d.fee + d.ad; });
+    k.breakEven = k.contribution > 0 ? Math.ceil(fixed / k.contribution) : null;
+    k.avgCups = sv / open.length;
+    var pb = sum(open, function (d) { return d.pb; }), by = sum(open, function (d) { return d.by; }), ta = sum(open, function (d) { return d.ta; });
+    k.conversion = pb > 0 ? by / pb : null;
+    k.lostSales = by > 0 ? ta / by : null;
+    var wst = sum(open, function (d) { return d.wst + d.sp; });
+    k.waste = cogs + wst > 0 ? wst / (cogs + wst) : null;
+    k.stockOutDays = open.filter(function (d) { return d.ta > 0; }).length / open.length;
+    k.overMadeDays = open.filter(function (d) { return d.wp > 0; }).length / open.length;
+    // price elasticity: slope of ln(conversion) on ln(price), using days with buyers
+    var pts = open.filter(function (d) { return d.pb > 0 && d.by > 0 && d.pr > 0; }).map(function (d) { return [Math.log(d.pr), Math.log(d.by / d.pb)]; });
+    var prices = {}; open.forEach(function (d) { prices[d.pr] = 1; });
+    k.elasticity = pts.length >= 5 && Object.keys(prices).length >= 2 ? slope(pts) : null;
+    // marketing return: extra profit on advertising days per unit of ad spend
+    var adD = open.filter(function (d) { return d.ad > 0; }), noAd = open.filter(function (d) { return d.ad === 0; });
+    k.adDays = adD.length;
+    k.adReturn = adD.length >= 2 && noAd.length >= 2 ? (avg(adD, function (d) { return d.np + d.ad; }) - avg(noAd, function (d) { return d.np; })) / avg(adD, function (d) { return d.ad; }) : null;
+    // risk and behaviour
+    k.loanDays = days.filter(function (d) { return d.loan > 0; }).length / days.length;
+    var afterLoss = 0, cutAfterLoss = 0;
+    for (var i = 1; i < days.length; i++) if (days[i - 1].np < 0 && days[i].g === days[i - 1].g && !days[i].cl) { afterLoss++; if (days[i].pr < days[i - 1].pr) cutAfterLoss++; }
+    k.cutAfterLoss = afterLoss >= 3 ? cutAfterLoss / afterLoss : null;
+    var storm = open.filter(function (d) { return d.w === 'stormy' || d.w === 'rainy'; });
+    k.badWeatherProfit = storm.length ? avg(storm, function (d) { return d.np; }) : null;
+    // learning curve: first 7 vs latest 7 days
+    if (days.length >= 14) { k.first7 = avg(days.slice(0, 7), function (d) { return d.np; }); k.last7 = avg(days.slice(-7), function (d) { return d.np; }); }
+    k.taste = avg(open, function (d) { return d.tas; });
+    // compliance: the officer's visits and how they were handled
+    k.visits = days.filter(function (d) { return d.of; }).length;
+    k.bribes = days.filter(function (d) { return d.of === 'bribe'; }).length;
+    k.permit = days.some(function (d) { return d.pm; });
+    k.interest = sum(days, function (d) { return d.in || 0; });
+    return k;
+  }
+
+  /* ---------- MBA skill scores (0–100) with one feedback line per area ----------
+   * Copied into backend/archive/Reports.gs for the teacher's PDF reports: keep the two in step. */
+  var MIN_SKILL_DAYS = 5;
+  function skills(k) {
+    if (!k.open || k.days < MIN_SKILL_DAYS) return null;
+    var cl = function (x) { return Math.max(0, Math.min(1, x)); }, P = function (x) { return Math.round(x * 100) + '%'; };
+    var areas = [];
+    var gm = k.grossMargin == null ? 0 : k.grossMargin;
+    areas.push({ id: 'fin', name: 'Finance and accounting', concepts: 'Profitability, gross margin, working capital, leverage',
+      score: 50 * k.profitableShare + 25 * (1 - k.loanDays) + 25 * cl(gm / 0.6),
+      tip: k.loanDays > 0.3 ? 'Relied on loans on ' + P(k.loanDays) + ' of days. Plan cash for tomorrow\'s stock before spending (working capital).'
+        : k.profitableShare < 0.6 ? 'Only ' + P(k.profitableShare) + ' of days were profitable. Compare price with cost per cup every day (contribution margin).'
+        : gm < 0.4 ? 'Gross margin is thin (' + P(gm) + '). Cut ingredient cost or raise price where customers allow it.'
+        : 'Strong: profitable on ' + P(k.profitableShare) + ' of days with a ' + P(gm) + ' gross margin and little borrowing.' });
+    var waste = k.waste == null ? 0 : k.waste;
+    areas.push({ id: 'ops', name: 'Operations and supply chain', concepts: 'Inventory, perishables, capacity, matching supply to demand',
+      score: 50 * (1 - cl(waste / 0.3)) + 25 * (1 - k.stockOutDays) + 25 * (1 - k.overMadeDays),
+      tip: waste > 0.15 ? P(waste) + ' of ingredient cost was wasted. Buy closer to expected demand (inventory control of perishables).'
+        : k.stockOutDays > 0.3 ? 'Ran out of stock on ' + P(k.stockOutDays) + ' of days and lost sales. Keep a little safety stock on busy days.'
+        : k.overMadeDays > 0.5 ? 'Poured lemonade away on ' + P(k.overMadeDays) + ' of days. Match production to the forecast.'
+        : 'Strong: low waste (' + P(waste) + ') and few stock-outs. Supply matched demand well.' });
+    var conv = k.conversion == null ? 0 : k.conversion;
+    areas.push({ id: 'mkt', name: 'Marketing and pricing', concepts: 'Price elasticity, product quality, conversion, marketing return',
+      score: 40 * cl(conv / 0.5) + 30 * k.taste / 100 + 30 * (k.adReturn == null ? 0.5 : cl(k.adReturn)),
+      tip: k.taste < 75 ? 'Average taste was ' + Math.round(k.taste) + '. Balance lemons and sugar and match ice to the weather (product quality).'
+        : conv < 0.3 ? 'Only ' + P(conv) + ' of passers-by bought. The price may be above what customers expect (price elasticity).'
+        : k.adReturn != null && k.adReturn < 1 ? 'Advertising did not pay for itself. Measure the return before spending more (marketing ROI).'
+        : !k.adDays ? 'Never tried advertising. Test it on busy days and compare the results.'
+        : 'Strong: good taste, ' + P(conv) + ' of passers-by bought, and advertising paid back.' });
+    var bw = k.badWeatherProfit, cut = k.cutAfterLoss;
+    areas.push({ id: 'risk', name: 'Risk and decision-making', concepts: 'Forecasting, risk management, loss aversion, test and learn',
+      score: 40 * (bw == null ? 0.5 : bw >= 0 ? 1 : 0.3) + 30 * (cut == null ? 0.5 : cl(1 - Math.abs(cut - 0.4) / 0.6)) + 30 * (k.elasticity != null ? 1 : 0.3),
+      tip: bw != null && bw < 0 ? 'Lost money on rainy and stormy days. Scale down or close when the forecast is bad (risk management).'
+        : cut != null && cut > 0.7 ? 'Cut the price after ' + P(cut) + ' of loss days. Find the cause before reacting (loss aversion).'
+        : k.elasticity == null ? 'Tried too few prices to learn how customers respond. Experiment with price (test and learn).'
+        : 'Strong: handled bad weather and reacted to losses calmly.' });
+    if (k.visits || k.permit) {
+      var bs = k.visits ? k.bribes / k.visits : 0;
+      areas.push({ id: 'eth', name: 'Ethics and compliance', concepts: 'Regulatory compliance, corruption as a recurring cost, governance',
+        score: 100 - 80 * bs - (!k.permit && k.visits >= 3 ? 20 : 0),
+        tip: k.bribes ? 'Paid bribes on ' + k.bribes + ' of ' + k.visits + ' officer visits. A bribe comes back every second day; the permit is a one-time cost (compliance as investment).'
+          : !k.permit && k.visits >= 3 ? 'Paid fines or closed on ' + k.visits + ' officer visits. A Street Vending Permit would have stopped them.'
+          : 'Strong: stayed within the rules' + (k.permit ? ' and bought the Street Vending Permit.' : '.') });
+    }
+    if (k.first7 != null) {
+      var gain = (k.last7 - k.first7) / Math.max(Math.abs(k.first7), 100);
+      areas.push({ id: 'learn', name: 'Learning and growth', concepts: 'Learning curve, continuous improvement',
+        score: 50 + 50 * Math.max(-1, Math.min(1, gain)),
+        tip: gain > 0.1 ? 'Daily profit rose from the first week to the latest. Clear learning.' : gain < -0.1 ? 'Daily profit fell from the first week to the latest. Review what changed.' : 'Daily profit stayed about the same. Try one new idea at a time.' });
+    }
+    var tot = 0;
+    areas.forEach(function (a) { a.score = Math.round(Math.max(0, Math.min(100, a.score))); tot += a.score; });
+    var overall = Math.round(tot / areas.length);
+    return { overall: overall, grade: overall >= 80 ? 'Excellent' : overall >= 65 ? 'Good' : overall >= 50 ? 'Fair' : 'Needs work', areas: areas };
+  }
+
+  return { kpis: kpis, skills: skills };
+})();
+
+var NOTES = {
+"Profitability (net profit margin)": {
+"d": "Net profit margin is the share of sales revenue left as profit after every cost, including interest and tax, has been paid.",
+"n": "Margin, not sales, tells you whether a business is healthy. Two kirana stores can both sell ₹1 lakh a month; the one keeping ₹15,000 is stronger than the one keeping ₹3,000. Managers watch margin because it absorbs shocks: a thin margin turns one bad week into a loss. Raising margin means either earning more per sale (price, product mix) or spending less per sale (cost control).",
+"f": "Net profit margin = Net profit ÷ Sales revenue × 100",
+"full": "Net margin of 40% or more"
+},
+"Gross margin": {
+"d": "Gross margin is the share of sales left after paying only the direct cost of the goods sold, before fixed costs.",
+"n": "Gross margin shows the strength of the product itself. A chai stall that pays ₹4 in milk, tea and sugar for a ₹10 cup has a 60% gross margin; everything else (rent, wages, interest) must come out of that ₹6. If gross margin is weak, no amount of cost-cutting on fixed costs will make the business strongly profitable.",
+"f": "Gross margin = (Sales − Cost of goods sold) ÷ Sales × 100",
+"full": "Gross margin of 60% or more"
+},
+"Contribution margin per cup": {
+"d": "Contribution margin is the selling price of one unit minus its variable cost; it is what each unit contributes towards fixed costs and profit.",
+"n": "Contribution thinking answers \"is one more sale worth it?\". An auto-rickshaw driver who earns ₹120 for a trip that costs ₹40 in fuel contributes ₹80 towards the vehicle EMI and his income. Products with high contribution deserve the push on busy days; products with low or negative contribution should be repriced or dropped.",
+"f": "Contribution per unit = Price per unit − Variable cost per unit",
+"full": "Contribution is most of the price (contribution ratio 70% or more)"
+},
+"Break-even analysis": {
+"d": "The break-even point is the sales volume at which total revenue equals total cost, so profit is exactly zero.",
+"n": "Break-even tells a manager how much must be sold before any profit appears. A tea stall owner who knows he needs 60 cups to cover rent and the helper's wage knows, before opening, whether a rainy morning is likely to lose money. Lower fixed costs or a higher contribution per unit both bring the break-even point down and make the business safer.",
+"f": "Break-even units = Fixed costs ÷ Contribution per unit",
+"full": "Sold above break-even on every open day"
+},
+"Working capital and liquidity": {
+"d": "Working capital is the cash a business needs to run day to day: buying stock, paying wages and meeting bills before customers pay.",
+"n": "Profitable businesses still fail when they run out of cash. A garment shop with a full warehouse but an empty bank account cannot pay its weavers on Friday. Liquidity is the ability to meet the next payment. Good managers keep a cash cushion, time big purchases after good days, and never spend tomorrow's stock money on an upgrade.",
+"f": "Liquidity buffer = Cash on hand ÷ One day's operating cash need",
+"full": "Never short of a cash cushion (cash below ₹500 on 0% of days)"
+},
+"Cost of debt and leverage": {
+"d": "Leverage is the use of borrowed money to run or grow a business; the cost of debt is the interest and fees paid for it.",
+"n": "Borrowing magnifies results both ways. A shopkeeper who borrows ₹50,000 at 2% a month to stock Diwali goods and earns 10% a month gains from leverage; if sales disappoint, the interest still has to be paid. Debt is useful only when the return on the borrowed money is clearly higher than its cost.",
+"f": "Borrowing cost ratio = (Interest + Loan fees) ÷ Sales × 100",
+"full": "Borrowing cost near 0% of sales"
+},
+"Choice of lender (cost of capital)": {
+"d": "The cost of capital is the price a business pays for money from each source: family, banks, informal lenders or investors.",
+"n": "Different money has different prices. Family loans are cheap but limited; bank loans need collateral and an EMI; informal moneylenders charge very high daily rates that compound quickly. Many small Indian businesses are trapped by informal debt. A good manager always compares the effective cost of each source before borrowing.",
+"f": "Amount owed after n days = Principal × (1 + daily rate)^n",
+"full": "Cheapest source used; never the moneylender"
+},
+"Debt servicing and default risk": {
+"d": "Debt servicing is meeting every scheduled repayment of a loan; default is failing to do so, which lets the lender seize collateral.",
+"n": "Lenders protect themselves with collateral. A truck owner who misses five EMIs can lose the truck, and with it his income. The test before borrowing is the interest coverage ratio: does a normal day's profit cover the repayment comfortably, even on a bad day?",
+"f": "Interest coverage = Operating profit ÷ Interest and principal due",
+"full": "All repayments made, nothing seized"
+},
+"Wealth creation (net worth and retained earnings)": {
+"d": "Net worth is what the owner would keep if everything were sold and all debts paid: assets minus liabilities.",
+"n": "Net worth is the scoreboard of ownership. Retained profit, not a single good day, builds it. A small business that keeps ₹2,000 of profit each day and avoids losses grows its net worth steadily, which later funds expansion without borrowing. Decisions should be judged by their effect on net worth, not on today's cash alone.",
+"f": "Net worth = Cash + Stock + Equipment − All loans",
+"full": "Net worth at least doubled"
+},
+"Taxation and tax planning": {
+"d": "Tax planning means setting aside enough cash for tax when it falls due, and treating tax as a normal cost of earning profit.",
+"n": "Under India's GST and income tax rules, small businesses pay tax on a schedule, and the cash must be there on the due date. Traders who spend everything in good weeks are caught short when advance tax is due. In the game, 10% of each week's profit is taken every seventh day; a good manager keeps that money aside.",
+"f": "Tax due = Weekly profit × Tax rate (10%)",
+"full": "Every tax day still left a day's stock money"
+},
+"Production planning (matching supply to demand)": {
+"d": "Production planning decides how much to produce so that supply meets expected demand without large surplus or shortage.",
+"n": "Both mistakes cost money: too little production loses sales, too much is wasted. A sweet shop before Diwali plans production from last year's sales, the calendar and advance orders. The manager's job is to forecast demand from the information available (weather, events, reputation) and produce close to it.",
+"f": "Match ratio = Smaller of (units made, units demanded) ÷ Larger",
+"full": "Made what was sold, day after day (match 100%)"
+},
+"Inventory control and waste": {
+"d": "Inventory control keeps stock at the level the business needs; waste is stock that is thrown away unused.",
+"n": "Stock is cash sitting on a shelf. For a restaurant, leftover cooked food at closing time is a direct loss. Lean businesses buy little and often, keep only what they will use, and track waste as a percentage of what they buy, so a rise in waste is spotted early.",
+"f": "Waste ratio = Value wasted ÷ (Value used + Value wasted) × 100",
+"full": "No waste (score 0 at 30% waste)"
+},
+"Capacity and stock-outs": {
+"d": "Capacity is the most a business can serve in a period; a stock-out is running out so that willing customers are turned away.",
+"n": "A turned-away customer is lost revenue and often a lost future customer. A popular dosa stall with one tawa caps its sales however long the queue. Managers expand capacity (equipment, staff) where stock-outs are frequent, and keep safety stock on days demand is likely to be high.",
+"f": "Lost sales rate = Customers turned away ÷ Customers who wanted to buy",
+"full": "Never turned buyers away"
+},
+"Perishable goods (spoilage)": {
+"d": "Perishable goods lose value with time; spoilage is the value lost when they go bad before use.",
+"n": "Fruit, milk and flowers must be sold fast. Phool-mandi traders buy at dawn and sell out by noon. First-in, first-out (FIFO) use and small, frequent orders keep spoilage low. In the game, lemons go bad after a few days and ice melts overnight.",
+"f": "Spoilage rate = Value spoiled ÷ Value of perishables bought × 100",
+"full": "No spoilage (score 0 at 15%)"
+},
+"Product quality": {
+"d": "Product quality is how well the product meets customer expectations; in the game it is measured as taste.",
+"n": "Quality drives repeat customers and word of mouth. Many Indian food brands (from Haldiram's to local sweet shops) built their names on consistent taste. Quality must be managed through the recipe and process, not left to chance.",
+"f": "Quality score = Average taste rating out of 100",
+"full": "Taste 100"
+},
+"Process consistency": {
+"d": "Process consistency is delivering the same quality every time, usually through standard operating procedures (SOPs).",
+"n": "Customers trust what they can predict. A McDonald's burger in Pune tastes like one in Delhi because of SOPs. In a small business, a written recipe and a routine remove day-to-day swings in quality that lose customers.",
+"f": "Consistency = Standard deviation of daily quality (lower is better)",
+"full": "Same quality every day (score 0 at ±20 points)"
+},
+"Purchasing and supplier deals": {
+"d": "Purchasing is buying inputs at the right price, time and quantity; supplier deals are temporary discounts or shortages.",
+"n": "Smart buyers stock up when prices dip and buy only what they need when prices rise. A restaurant buying onions in bulk when prices crash, and storing them well, protects its margin for months. Buying should follow price signals and storage limits.",
+"f": "Deal response = Buying on discount days ÷ Buying on normal days",
+"full": "Bought twice as much on discount days (ratio 2×)"
+},
+"Value-based pricing": {
+"d": "Value-based pricing sets price by what customers are willing to pay, rather than by cost alone.",
+"n": "Customers pay for value, not for your costs. A bottle of water costs more at a cricket stadium than in a shop because its value there is higher. Price close to the customer's idea of a fair price for the situation: too high loses buyers, too low leaves money on the table.",
+"f": "Price index = Your price ÷ Fair price for the conditions × 100",
+"full": "Price about 105% of the fair price"
+},
+"Dynamic pricing (responding to demand)": {
+"d": "Dynamic pricing changes price with demand conditions such as weather, time or events.",
+"n": "Ola and Uber raise fares when demand peaks; hotels charge more in wedding season. In a lemonade stand, hot days bring thirsty customers who accept higher prices, while cool days need lower prices. Following demand captures more value on busy days and keeps sales going on slow ones.",
+"f": "Responsiveness = Correlation of your price with the fair price over time",
+"full": "Price follows demand exactly (correlation 1)"
+},
+"Price experimentation and elasticity": {
+"d": "Price elasticity of demand measures how much the quantity bought changes when the price changes.",
+"n": "Managers learn elasticity by testing prices. If a 10% price rise reduces buyers by 20%, demand is elastic (elasticity −2) and the rise loses revenue; if buyers fall only 5%, it gains. Testing a few prices in similar conditions shows which side of that line your product is on.",
+"f": "Elasticity = % change in quantity ÷ % change in price",
+"full": "5 or more prices tried and elasticity learned"
+},
+"Conversion rate": {
+"d": "Conversion rate is the share of people reached who actually buy.",
+"n": "Conversion combines price, product and reputation into one number. An e-commerce site watches how many visitors become buyers; a stall watches how many passers-by stop. A falling conversion rate is an early warning that price is too high or quality has slipped.",
+"f": "Conversion = Buyers ÷ People reached × 100",
+"full": "Half of passers-by buy (50%)"
+},
+"Marketing return on investment": {
+"d": "Marketing ROI is the extra profit generated by marketing, compared with what the marketing cost.",
+"n": "Every rupee of advertising must earn more than a rupee back. Brands test campaigns on a few cities before going national to measure the return. Spending on ads without measuring the extra profit is a common way small businesses waste money.",
+"f": "Marketing ROI = (Extra profit from ads − Ad cost) ÷ Ad cost",
+"full": "Advertising pays for itself (ROI above 0)"
+},
+"Targeting marketing spend": {
+"d": "Targeting means spending marketing money where and when it reaches the most likely buyers.",
+"n": "Ice-cream brands advertise in summer, not in the monsoon. Spending on days when few customers are around wastes the budget. Good targeting ties spend to the forecast: more on hot, busy days, little on rainy ones.",
+"f": "Targeting = Ad spend on busy days ÷ Total ad spend",
+"full": "All ad spend on busy (hot and sunny) days"
+},
+"Product differentiation": {
+"d": "Product differentiation makes a product distinct from competitors so customers will pay more for it.",
+"n": "A premium product lets you serve customers who value something special. Amul sells both basic milk and premium cheese; masala chai sells at a higher price than plain chai. A premium product is worth offering when its extra price covers its extra cost.",
+"f": "Premium payoff = Profit a day with premium − Profit a day with standard",
+"full": "Premium product earned more"
+},
+"Brand equity and reputation": {
+"d": "Brand equity is the value of a business's reputation: customers come back and recommend it because they trust it.",
+"n": "Reputation is an asset built slowly and lost quickly. A stall known for fair prices and great taste draws a crowd without advertising. Consistent quality, serving everyone and fair pricing raise reputation; stock-outs and poor taste damage it.",
+"f": "Reputation change = Reputation at the end − Reputation at the start",
+"full": "Reputation up 20 points or more"
+},
+"Using forecasts (decisions under uncertainty)": {
+"d": "Decision-making under uncertainty means acting on the best available forecast even though the outcome is not certain.",
+"n": "Farmers sow by the monsoon forecast; retailers stock by expected demand. A forecast is not always right, but ignoring it is worse. Good decisions are judged by the information available at the time, not by the luck of the result.",
+"f": "Forecast use = Days the decision matched the forecast ÷ All days",
+"full": "Right ice every day"
+},
+"Risk management": {
+"d": "Risk management reduces exposure to large losses: scaling down, insuring or staying out when the downside is high.",
+"n": "A wedding caterer who keeps a backup generator manages risk. In the game, storms bring few customers but the same fixed costs. Closing or scaling down on a storm forecast cuts the loss. Managers compare the possible loss with the possible gain before committing.",
+"f": "Downside = Average profit on bad-weather days",
+"full": "No losses in bad weather"
+},
+"Loss aversion (behavioural bias)": {
+"d": "Loss aversion is the tendency to feel losses more strongly than equal gains, which leads to panicky decisions after a loss.",
+"n": "Behavioural economists (Kahneman and Tversky) showed people weigh a ₹100 loss about twice as heavily as a ₹100 gain. After a bad day, a shopkeeper may slash prices out of fear, even when the loss came from weather, not price. Good managers find the cause before reacting.",
+"f": "Reaction rate = Days price was cut after a loss ÷ Loss days",
+"full": "Cuts after about 40% of loss days, not in panic"
+},
+"Learning curve": {
+"d": "The learning curve describes how performance improves with experience as a person or firm learns from results.",
+"n": "Factories produce each unit more cheaply as workers gain experience; a new shopkeeper prices better after a few months. If performance does not improve, the manager is not learning from the feedback. Comparing early results with recent ones measures learning.",
+"f": "Learning = (Recent average profit − Early average profit) ÷ Early average profit",
+"full": "Profit doubled with experience"
+},
+"Responding to market events": {
+"d": "Responding to market events means adjusting stock, price and spending when conditions change suddenly.",
+"n": "Shops near a stadium stock up on match days; a road closure calls for lower costs. Events are opportunities and threats that do not repeat on a schedule, so the manager must read them and act on the day: more stock and a firmer price for a festival, less stock and no ads for a closure.",
+"f": "Event response = Profit on event days compared with similar normal days",
+"full": "Stocked up and served more on busy events; cut costs on slow ones"
+},
+"Competitive response": {
+"d": "Competitive response is how a business reacts when a rival enters or runs a promotion.",
+"n": "When Jio cut data prices, rivals had to respond or lose customers. A small business can respond with price, quality or service. Ignoring a rival's promotion usually means losing share for those days.",
+"f": "Response = Your price index on rival days ÷ Your price index on other days",
+"full": "Priced at least 5% sharper against the rival"
+},
+"Capital investment decisions": {
+"d": "Capital investment is spending on long-lived assets that raise future capacity, quality or efficiency.",
+"n": "A tailor who buys a faster sewing machine invests today to earn more for years. The payback period (cost ÷ extra profit a day) shows whether an investment is worth it. Good investments pay back quickly and fit the business's demand.",
+"f": "Payback period = Investment cost ÷ Extra profit per day",
+"full": "3 or more upgrades"
+},
+"Business growth and scale": {
+"d": "Scaling a business means moving to a larger format that raises capacity and revenue, usually with higher fixed costs.",
+"n": "Growing from a cart to a kiosk to a shop is the classic path of Indian food businesses. Each step brings economies of scale but also higher rent and wages. Growth is wise when demand already exceeds current capacity.",
+"f": "Scale benefit = Extra contribution from extra capacity − Extra fixed costs",
+"full": "Moved up a stand tier"
+},
+"Equity financing and dilution": {
+"d": "Equity financing raises money by selling a share of the business; dilution is the owner's share of future profit that is given away.",
+"n": "Shark Tank India shows founders trading equity for capital. Equity needs no repayment, but the investor takes a share of every future profit. It is worth it only if the money creates more profit than the share given away.",
+"f": "Cost of equity = Investor's share × Future profits",
+"full": "Took equity only when it paid off"
+},
+"Timing of expansion": {
+"d": "Timing of expansion is choosing when to grow so that demand and cash can carry the higher costs.",
+"n": "Expanding too early strains cash; too late leaves sales to competitors. A restaurant opening a second branch should do so when the first is full most evenings and cash reserves cover several months of the new branch's costs.",
+"f": "Expansion result = Average profit after − Average profit before",
+"full": "Profit rose after expanding"
+},
+"Return on investment (upgrades)": {
+"d": "Return on investment (ROI) measures the profit an investment adds compared with its cost.",
+"n": "Every upgrade should be judged by what it adds to profit afterwards, not by its price or how it looks. Businesses review past investments to learn which kinds pay back, then repeat those.",
+"f": "ROI = (Extra profit from investment − Cost) ÷ Cost × 100",
+"full": "Every upgrade raised profit"
+},
+"Sustainable growth": {
+"d": "Sustainable growth is steady growth the business can keep up, without bursts followed by losses.",
+"n": "Steady compounding beats boom and bust. Businesses that grow every quarter by reinvesting profit outlast those that grow fast on debt and then collapse. Rising net worth across most periods shows sustainable growth.",
+"f": "Sustainability = Periods with rising net worth ÷ All periods",
+"full": "Net worth rose in every five-day stretch"
+},
+"Scaling through stand tiers": {
+"d": "Scaling through tiers means moving up to a bigger stand as soon as the business qualifies, and then using the new capacity.",
+"n": "Growth opportunities have a window. A business that qualifies for a bigger format but waits keeps turning customers away. Once it moves up, the extra capacity must be filled, or the higher fee becomes a burden.",
+"f": "Capacity use = Cups served ÷ Stand capacity",
+"full": "Moved up within 5 days of qualifying and used 70%+ of new capacity"
+},
+"Workforce planning (staffing to demand)": {
+"d": "Workforce planning matches the number of staff to expected demand.",
+"n": "Restaurants add waiters on weekends and festivals and fewer on weekday afternoons. Staff are a cost every day they work, so the manager schedules them for busy periods and avoids paying for idle hands.",
+"f": "Staffing fit = Helper days on busy forecasts ÷ All helper days",
+"full": "Helper only on busy days, no lost buyers"
+},
+"Employee morale": {
+"d": "Employee morale is the motivation and attitude of staff, which falls after repeated failure or poor treatment.",
+"n": "People work better in a winning team. Long losing runs, late wages and blame lower morale and productivity. Managers protect morale by avoiding needless losses and keeping work predictable.",
+"f": "Morale risk = Helper days after 3 or more losses in a row",
+"full": "No long losing runs with staff"
+},
+"Labour productivity": {
+"d": "Labour productivity is output per worker; extra staff pay off only when their capacity is used.",
+"n": "A second worker at a juice centre is worthwhile only if there are enough customers for both. Productivity falls when staff wait idle. Managers compare the extra output a worker makes possible with the wage paid.",
+"f": "Productivity = Extra units served thanks to staff ÷ Extra capacity they add",
+"full": "All extra capacity used"
+},
+"Fixed costs and operating leverage (hiring)": {
+"d": "Operating leverage is the effect of fixed costs on profit: high fixed costs raise profit fast when sales rise and cut it fast when they fall.",
+"n": "A wage is a fixed cost for the day. With high operating leverage, a busy day is very profitable and a quiet day very costly. Hiring pays off when extra sales cover the wage with room to spare.",
+"f": "Degree of operating leverage = Contribution ÷ Operating profit",
+"full": "Helper days earned more than the wage"
+},
+"Regulatory compliance": {
+"d": "Regulatory compliance is following the laws and licences that apply to a business.",
+"n": "Street vendors in India are covered by the Street Vendors Act, 2014, and need a vending certificate. Compliance costs money once but avoids repeated fines, closures and harassment. It is an investment in being able to trade without interruption.",
+"f": "Compliance cost = Licence cost (one time)",
+"full": "Bought the permit"
+},
+"Corruption as a recurring cost": {
+"d": "A bribe is an illegal payment to an official; it creates an expectation that it will be paid again.",
+"n": "Bribery is not a one-time fix. Once paid, the official returns, and the business is exposed to legal risk and loss of reputation. India's Prevention of Corruption Act punishes both giving and taking bribes. Ethical businesses refuse and comply instead.",
+"f": "Bribe rate = Bribes paid ÷ Officer visits",
+"full": "Never paid a bribe"
+},
+"Cost of compliance vs cost of non-compliance": {
+"d": "This compares the one-time cost of doing things right with the repeated cost of fines, bribes and closures.",
+"n": "Companies invest in compliance because non-compliance is usually more expensive in the end: penalties, closures and lost trust. The right comparison is the total cost over time, not just today's payment.",
+"f": "Non-compliance cost = Fines + Bribes + Lost trading days",
+"full": "Bought the permit before repeated visits"
+}
+};
+var AREA_INTRO = {"Finance and accounting": "How well you made, kept and protected money: margins, break-even, cash, borrowing and wealth.", "Operations and supply chain": "How well you turned ingredients into lemonade: planning, stock, waste, capacity and quality.", "Marketing and pricing": "How well you priced, promoted and positioned the product, and built the brand.", "Economics and decision-making": "How well you decided under uncertainty: forecasts, risk, biases, learning and market events.", "Strategy and growth": "How well you invested, competed and grew the business over time.", "People and organisation": "How well you used staff: when to hire, how productive they were, and whether they paid off.", "Ethics and compliance": "How you dealt with the law: permits, officers, fines and bribes."};
+
+/* ---------- Student workbook and faculty group report (report design v2, 21 Nov 2026) ----------
+ * One HTML document per student (9 parts + appendix) and per group (class analytics). Built from studentReport()
+ * output. Charts are inline SVG in the admin panel (SVG_OK); Google Drive's HTML→PDF conversion cannot draw SVG,
+ * so there each chart falls back to the bar/table version. */
+var SVG_OK = false;
+function vis(svg, fallback) { return SVG_OK ? svg : (fallback || ''); }
+var WB_CSS = '<style>@page{size:A4;margin:16mm 15mm}*{box-sizing:border-box}body{font-family:"Segoe UI",Arial,sans-serif;color:#111827;font-size:10pt;line-height:1.45;margin:0}' +
+  '.pg{page-break-after:always}.pg.flow{page-break-after:auto;margin-bottom:12px}h1{font-size:19pt;margin:0 0 2px}h2{font-size:14pt;margin:0 0 6px;color:#1e3a8a;border-bottom:2px solid #dbeafe;padding-bottom:3px}' +
+  'h3{font-size:11pt;margin:12px 0 4px}.part{font-size:8pt;letter-spacing:.08em;text-transform:uppercase;color:#6b7280}.muted{color:#6b7280}.sm{font-size:8.5pt}' +
+  'table{width:100%;border-collapse:collapse;margin:4px 0 8px}th,td{border-bottom:1px solid #e5e7eb;padding:3px 5px;text-align:left;vertical-align:top}th{background:#f9fafb;font-size:9pt}' +
+  '.n{text-align:right}.kp{display:inline-block;width:23%;margin:0 1% 6px 0;border:1px solid #e5e7eb;border-radius:6px;padding:5px 8px;vertical-align:top}.kp b{display:block;font-size:15pt}.kp span{font-size:8pt;color:#6b7280}' +
+  '.bx{border:1px solid #e5e7eb;border-radius:6px;padding:6px 10px;margin:6px 0}.nt{background:#eff6ff;border-color:#bfdbfe}.wn{background:#fef2f2;border-color:#fecaca}.ok{background:#f0fdf4;border-color:#bbf7d0}' +
+  '.cc{border:1px solid #e5e7eb;border-radius:6px;padding:6px 9px;margin:6px 0;page-break-inside:avoid;font-size:8.8pt;line-height:1.38}.cc .lb{font-size:7.5pt;text-transform:uppercase;letter-spacing:.05em;color:#6b7280;margin-top:3px}' +
+  '.c2{display:table;width:100%}.c2>div{display:table-cell;width:50%;vertical-align:top;padding-right:10px}.fm{font-family:Consolas,monospace;background:#f3f4f6;padding:1px 6px;border-radius:4px;font-size:8.5pt}' +
+  '.tag{background:#fef3c7;border-radius:8px;padding:0 6px;font-size:7.5pt}.gr{font-size:36pt;font-weight:800;line-height:1}</style>';
+var WXN = { hot: 'Hot', sunny: 'Sunny', cloudy: 'Cloudy', cool: 'Cool', rainy: 'Rainy', stormy: 'Stormy' }, WXO = ['hot', 'sunny', 'cloudy', 'cool', 'rainy', 'stormy'];
+var WXC = { hot: '#f59e0b', sunny: '#fbbf24', cloudy: '#9ca3af', cool: '#a5b4fc', rainy: '#60a5fa', stormy: '#1e3a8a' };
+var EVN = { festival: 'Festival', sports: 'Cricket match', holiday: 'School holiday', closure: 'Road closure', competitor: 'Rival promotion', discount: 'Supplier discount', shortage: 'Supplier shortage' };
+
+/* ---------- small SVG helpers ---------- */
+function sv(w, h, body, label) { return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ' + w + ' ' + h + '" width="100%" role="img" aria-label="' + e(label) + '" style="font-family:inherit;font-size:11px">' + body + '</svg>'; }
+function tx(x, y, s, o) { o = o || {}; return '<text x="' + x.toFixed(1) + '" y="' + y.toFixed(1) + '" font-size="' + (o.size || 11) + '" fill="' + (o.fill || '#111827') + '" text-anchor="' + (o.a || 'start') + '" font-weight="' + (o.w || 400) + '">' + e(s) + '</text>'; }
+function svBars(rows, maxv) {   // rows: [label, value, ticks[], colour]
+  maxv = maxv || 100; var W = 680, rh = 24, H = rows.length * rh + 12, lab = 230, bw = W - lab - 56, b = '';
+  rows.forEach(function (r, i) {
+    var y = 6 + i * rh, ln = clamp01(r[1] / maxv) * bw;
+    b += tx(lab - 8, y + 14, r[0], { a: 'end', size: 11 }) + '<rect x="' + lab + '" y="' + (y + 4) + '" width="' + bw + '" height="13" rx="3" fill="#e5e7eb"/>' +
+      '<rect x="' + lab + '" y="' + (y + 4) + '" width="' + ln.toFixed(1) + '" height="13" rx="3" fill="' + (r[3] || '#2563eb') + '"/>' + tx(lab + bw + 6, y + 15, Math.round(r[1]), { size: 11 });
+    (r[2] || []).forEach(function (t, j) { if (t == null) return; var x = lab + clamp01(t / maxv) * bw; b += '<line x1="' + x.toFixed(1) + '" x2="' + x.toFixed(1) + '" y1="' + (y + 1) + '" y2="' + (y + 20) + '" stroke="' + (j ? '#16a34a' : '#111827') + '" stroke-width="2"/>'; });
+  });
+  return sv(W, H, b, 'bars');
+}
+function svLine(pts, o) {   // pts: [x, y]; o: {color, marks:[[x,label]], fmt}
+  o = o || {}; var W = 680, H = o.h || 210, L = 74, R = 16, T = 14, B = 28, fmt = o.fmt || function (v) { return Math.round(v); };
+  var xs = pts.map(function (p) { return p[0]; }), ys = pts.map(function (p) { return p[1]; }), x0 = Math.min.apply(null, xs), x1 = Math.max.apply(null, xs);
+  var y0 = Math.min(0, Math.min.apply(null, ys)), y1 = Math.max.apply(null, ys); if (y1 === y0) y1 = y0 + 1; if (x1 === x0) x1 = x0 + 1;
+  var X = function (x) { return L + (x - x0) / (x1 - x0) * (W - L - R); }, Y = function (y) { return T + (1 - (y - y0) / (y1 - y0)) * (H - T - B); }, b = '';
+  for (var k = 0; k <= 4; k++) { var v = y0 + (y1 - y0) * k / 4; b += '<line x1="' + L + '" x2="' + (W - R) + '" y1="' + Y(v).toFixed(1) + '" y2="' + Y(v).toFixed(1) + '" stroke="#e5e7eb"/>' + tx(L - 6, Y(v) + 4, fmt(v), { a: 'end', size: 10, fill: '#6b7280' }); }
+  b += '<polyline fill="none" stroke="' + (o.color || '#2563eb') + '" stroke-width="1.6" points="' + pts.map(function (p) { return X(p[0]).toFixed(1) + ',' + Y(p[1]).toFixed(1); }).join(' ') + '"/>';
+  for (k = 0; k <= 5; k++) { var xv = Math.round(x0 + (x1 - x0) * k / 5); b += tx(X(xv), H - 9, 'Day ' + xv, { a: 'middle', size: 10, fill: '#6b7280' }); }
+  (o.marks || []).forEach(function (m, i) { var xx = X(m[0]), right = xx > W - 170; b += '<line x1="' + xx.toFixed(1) + '" x2="' + xx.toFixed(1) + '" y1="' + T + '" y2="' + (H - B) + '" stroke="#6b7280" stroke-dasharray="3 3"/>' + tx(right ? xx - 3 : xx + 3, T + 10 + (i % 4) * 12, m[1], { size: 9.5, a: right ? 'end' : 'start' }); });
+  return sv(W, H, b, o.label || 'line');
+}
+function svProfit(days, cur) {
+  var W = 680, H = 190, L = 74, R = 16, T = 10, B = 26, v = days.map(function (d) { return d.np; }), hi = Math.max.apply(null, v.concat([1])), lo = Math.min.apply(null, v.concat([0]));
+  var n = days.length, bw = (W - L - R) / n, Y = function (y) { return T + (1 - (y - lo) / (hi - lo)) * (H - T - B); }, b = '';
+  for (var k = 0; k <= 4; k++) { var vv = lo + (hi - lo) * k / 4; b += '<line x1="' + L + '" x2="' + (W - R) + '" y1="' + Y(vv).toFixed(1) + '" y2="' + Y(vv).toFixed(1) + '" stroke="#e5e7eb"/>' + tx(L - 6, Y(vv) + 4, money(vv, cur), { a: 'end', size: 10, fill: '#6b7280' }); }
+  days.forEach(function (d, i) { var y0 = Y(0), y1 = Y(d.np); b += '<rect x="' + (L + i * bw).toFixed(2) + '" y="' + Math.min(y0, y1).toFixed(1) + '" width="' + Math.max(bw, 0.6).toFixed(2) + '" height="' + Math.abs(y1 - y0).toFixed(1) + '" fill="' + (d.cl ? '#6b7280' : WXC[d.w] || '#9ca3af') + '"/>'; });
+  b += '<line x1="' + L + '" x2="' + (W - R) + '" y1="' + Y(0).toFixed(1) + '" y2="' + Y(0).toFixed(1) + '" stroke="#111827"/>';
+  for (k = 0; k <= 5; k++) { var i = Math.round((n - 1) * k / 5); b += tx(L + i * bw, H - 8, 'Day ' + days[i].d, { a: 'middle', size: 10, fill: '#6b7280' }); }
+  return sv(W, H, b, 'Daily profit by weather');
+}
+function svCols(cats, series, names, colors, fmt) {
+  var W = 680, H = 210, L = 46, R = 16, T = 24, B = 30, hi = Math.max.apply(null, [].concat.apply([1], series)), lo = Math.min.apply(null, [].concat.apply([0], series));
+  var band = (W - L - R) / cats.length, k = series.length, bw = Math.min(28, band / (k + 1)), Y = function (y) { return T + (1 - (y - lo) / (hi - lo)) * (H - T - B); }, b = '';
+  names.forEach(function (nm, j) { b += '<rect x="' + (L + j * 130) + '" y="4" width="10" height="10" fill="' + colors[j] + '"/>' + tx(L + 14 + j * 130, 13, nm); });
+  cats.forEach(function (c, i) {
+    series.forEach(function (s, j) { var x = L + i * band + band / 2 - k * bw / 2 + j * bw, y1 = Y(s[i]), y0 = Y(0);
+      b += '<rect x="' + x.toFixed(1) + '" y="' + Math.min(y0, y1).toFixed(1) + '" width="' + (bw - 3).toFixed(1) + '" height="' + Math.abs(y1 - y0).toFixed(1) + '" fill="' + colors[j] + '"/>' + tx(x + (bw - 3) / 2, Math.min(y0, y1) - 4, fmt(s[i]), { a: 'middle', size: 9.5 }); });
+    b += tx(L + i * band + band / 2, H - 12, c, { a: 'middle', size: 10.5 });
+  });
+  return sv(W, H, b + '<line x1="' + L + '" x2="' + (W - R) + '" y1="' + Y(0).toFixed(1) + '" y2="' + Y(0).toFixed(1) + '" stroke="#111827"/>', 'columns');
+}
+function svBridge(steps) {   // [label, value, 'add'|'sub'|'total']
+  var W = 680, H = 220, L = 26, T = 18, B = 36, n = steps.length, band = (W - L - 16) / n, bw = band * 0.6, run = 0, Y = function (y) { return T + (1 - y / 100) * (H - T - B); }, b = '';
+  steps.forEach(function (st, i) {
+    var x = L + i * band + (band - bw) / 2, a, z, c;
+    if (st[2] === 'total') { a = 0; z = st[1]; c = i === n - 1 ? '#2563eb' : '#9ca3af'; run = st[1]; }
+    else if (st[2] === 'add') { a = run; z = run + st[1]; c = '#16a34a'; run = z; } else { a = run - st[1]; z = run; c = '#dc2626'; run = a; }
+    b += '<rect x="' + x.toFixed(1) + '" y="' + Y(Math.max(a, z)).toFixed(1) + '" width="' + bw.toFixed(1) + '" height="' + Math.abs(Y(a) - Y(z)).toFixed(1) + '" fill="' + c + '"/>' +
+      tx(x + bw / 2, Y(Math.max(a, z)) - 5, (st[2] === 'sub' ? '−' : st[2] === 'add' ? '+' : '') + st[1], { a: 'middle', w: 600 }) + tx(x + bw / 2, H - 20, st[0], { a: 'middle', size: 10.5 });
+  });
+  return sv(W, H, b + '<line x1="' + L + '" x2="' + (W - 16) + '" y1="' + Y(0) + '" y2="' + Y(0) + '" stroke="#111827"/><line x1="' + L + '" x2="' + (W - 16) + '" y1="' + Y(40) + '" y2="' + Y(40) + '" stroke="#6b7280" stroke-dasharray="4 3"/>' + tx(W - 18, Y(40) - 4, 'Pass mark 40', { a: 'end', size: 10, fill: '#6b7280' }), 'Marks bridge');
+}
+function svStack(parts, cur) {   // [label, value, colour]
+  var W = 680, tot = parts.reduce(function (t, p) { return t + Math.max(0, p[1]); }, 0) || 1, x = 0, b = '', rows = Math.ceil(parts.length / 4);
+  parts.forEach(function (p) { var w = Math.max(0, p[1]) / tot * (W - 10); b += '<rect x="' + x.toFixed(1) + '" y="6" width="' + w.toFixed(1) + '" height="24" fill="' + p[2] + '"/>' + (w > 44 ? tx(x + w / 2, 22, Math.round(100 * p[1] / tot) + '%', { a: 'middle', fill: '#fff', w: 600, size: 10.5 }) : ''); x += w; });
+  parts.forEach(function (p, i) { var lx = (i % 4) * 170, ly = 48 + Math.floor(i / 4) * 16; b += '<rect x="' + lx + '" y="' + (ly - 9) + '" width="10" height="10" fill="' + p[2] + '"/>' + tx(lx + 14, ly, p[0] + ' ' + money(p[1], cur), { size: 10 }); });
+  return sv(W, 40 + rows * 16 + 8, b, 'Where each rupee of sales went');
+}
+
+/* ---------- facts about one attempt ---------- */
+function attemptFacts(days) {
+  var sum = function (f) { return days.reduce(function (t, d) { return t + (f(d) || 0); }, 0); }, n = days.length;
+  var pl = { rev: sum(function (d) { return d.rev; }), cogs: sum(function (d) { return d.cogs; }), wst: sum(function (d) { return d.wst; }), sp: sum(function (d) { return d.sp; }),
+    fee: sum(function (d) { return d.fee; }), ad: sum(function (d) { return d.ad; }), wg: sum(function (d) { return d.wg; }), int: sum(function (d) { return (d.in || 0) + (d.lf || 0); }),
+    fine: sum(function (d) { return (d.fi || 0) + (d.pn || 0); }), bribe: sum(function (d) { return d.bb; }), tax: sum(function (d) { return d.tx; }), inv: sum(function (d) { return d.iv; }), np: sum(function (d) { return d.np; }) };
+  pl.other = pl.np - (pl.rev - pl.cogs - pl.wst - pl.sp - pl.fee - pl.ad - pl.wg - pl.int - pl.fine - pl.bribe - pl.tax - pl.inv);
+  var W = {}; days.forEach(function (d) { var w = d.cl ? 'closed' : d.w, o = W[w] = W[w] || { days: 0, pr: 0, sv: 0, by: 0, pb: 0, np: 0, ad: 0, ta: 0 };
+    o.days++; o.pr += d.pr; o.sv += d.sv; o.by += d.by; o.pb += d.pb; o.np += d.np; o.ad += d.ad || 0; o.ta += d.ta; });
+  var blk = Math.max(5, Math.ceil(n / 12 / 5) * 5), chunks = [];
+  for (var i = 0; i < n; i += blk) { var c = days.slice(i, i + blk), cs = function (f) { return c.reduce(function (t, d) { return t + (f(d) || 0); }, 0); };
+    chunks.push({ from: c[0].d, to: c[c.length - 1].d, np: cs(function (d) { return d.np; }) / c.length, pr: cs(function (d) { return d.pr; }) / c.length, sv: cs(function (d) { return d.sv; }) / c.length,
+      waste: cs(function (d) { return d.wst + d.sp; }) / Math.max(1, cs(function (d) { return d.cogs + d.wst + d.sp; })), taste: cs(function (d) { return d.tas; }) / c.length,
+      loss: c.filter(function (d) { return d.np < 0; }).length, ta: c.filter(function (d) { return d.ta > 0; }).length }); }
+  var ev = []; days.forEach(function (d, i) { var p = i ? days[i - 1] : null;
+    if (d.of) ev.push([d.d, d.of === 'bribe' ? 'Officer visit: paid a bribe' : d.of === 'refuse' ? 'Officer visit: refused (penalty)' : 'Officer visit: ' + d.of]);
+    if (p && d.up > p.up) ev.push([d.d, 'Bought an upgrade (now ' + d.up + ')']); if (p && d.up < p.up) ev.push([d.d, 'Sold an upgrade']);
+    if (p && d.tier > p.tier) ev.push([d.d, 'Moved up to stand tier ' + d.tier]); if (d.pm && !(p && p.pm)) ev.push([d.d, 'Bought the Street Vending Permit']);
+    if (d.hp && !(p && p.hp) && !ev.some(function (x) { return /helper/.test(x[1]); })) ev.push([d.d, 'First hired a helper']);
+    if (d.rj > 0 && !(p && p.rj)) ev.push([d.d, 'Borrowed from the moneylender']); if (d.bk > 0 && !(p && p.bk)) ev.push([d.d, 'Took a bank loan']);
+    if (d.sz > 0) ev.push([d.d, 'Equipment seized by a lender']); if (d.iv && !ev.some(function (x) { return /investor/.test(x[1]); })) ev.push([d.d, 'Angel investor starts taking a share of profit']);
+    if (p && d.pd !== p.pd) ev.push([d.d, 'Switched to ' + (d.pd === 'pink' ? 'pink lemonade' : 'classic lemonade')]); });
+  var best = days.reduce(function (a, b) { return b.np > a.np ? b : a; }, days[0]), worst = days.reduce(function (a, b) { return b.np < a.np ? b : a; }, days[0]);
+  return { n: n, pl: pl, W: W, chunks: chunks, ev: ev, best: best, worst: worst, fixed: pl.fee / n + pl.ad / n + pl.wg / n + pl.int / n };
+}
+function pctile(v, p) { v = v.filter(function (x) { return x != null && !isNaN(x); }).sort(function (a, b) { return a - b; }); return v.length ? v[Math.floor(p * (v.length - 1))] : null; }
+
+/* ---------- self-check exercises: question and answer, using the student's own numbers where they help ---------- */
+function exercise(name, s, F) {
+  var k = s.k, cur = s.cur, m = function (x) { return money(x, cur); }, n = s.days.length, pl = F.pl;
+  var X = {
+    'Profitability (net profit margin)': ['Your sales were ' + m(pl.rev) + ' and net profit ' + m(pl.np) + '. If advertising (' + m(pl.ad) + ') had been cut to zero with no loss of sales, what would your net margin have been?', pc(pl.rev ? (pl.np + pl.ad) / pl.rev : 0)],
+    'Gross margin': ['Your cost of cups sold was ' + m(pl.cogs) + ' on sales of ' + m(pl.rev) + '. What was your gross profit?', m(pl.rev - pl.cogs)],
+    'Contribution margin per cup': ['Your average price was ' + m(k.avgPrice) + ' and ingredients cost ' + m(k.costPerCup) + ' a cup. If the cost per cup rose by ' + m(10) + ', what would contribution become?', m(k.avgPrice - k.costPerCup - 10)],
+    'Break-even analysis': ['Your daily fixed costs averaged ' + m(F.fixed) + ' and contribution was ' + m(k.contribution) + ' a cup. If the stand fee rose by ' + m(400) + ', how many cups would you need to break even?', (k.contribution > 0 ? Math.ceil((F.fixed + 400) / k.contribution) : '—') + ' cups'],
+    'Wealth creation (net worth and retained earnings)': ['Your net worth went from ' + m(s.days[0].nw - s.days[0].np) + ' to ' + m(s.days[n - 1].nw) + ' over ' + n + ' days. What was the average increase a day?', m((s.days[n - 1].nw - s.days[0].nw + s.days[0].np) / n)],
+    'Taxation and tax planning': ['You paid ' + m(pl.tax) + ' in tax over ' + n + ' days. How much should you set aside each day on average?', m(pl.tax / n)],
+    'Inventory control and waste': ['Your waste and spoilage cost ' + m(pl.wst + pl.sp) + '. If you had halved it, how much more net profit would you have made?', m((pl.wst + pl.sp) / 2)],
+    'Conversion rate': ['What share of passers-by bought from you, to the nearest per cent?', pc(k.conversion)],
+    'Price experimentation and elasticity': k.elasticity != null ? ['Your measured elasticity was ' + k.elasticity.toFixed(2) + '. If you raised price by 10%, roughly how would the number of buyers change?', 'About ' + Math.round(Math.abs(k.elasticity) * 10) + '% fewer buyers'] : null,
+    'Learning curve': k.first7 != null ? ['Your first 7 days averaged ' + m(k.first7) + ' a day and your last 7 days ' + m(k.last7) + '. What was the change?', Math.round(100 * (k.last7 - k.first7) / Math.max(Math.abs(k.first7), 100)) + '%'] : null,
+    'Cost of compliance vs cost of non-compliance': ['You paid ' + m(pl.bribe + pl.fine) + ' in fines, penalties and bribes against a ' + m(4000) + ' permit. Which was cheaper over your game?', pl.bribe + pl.fine > 4000 ? 'The permit, by ' + m(pl.bribe + pl.fine - 4000) : 'The fines and bribes, but bribery is illegal and the visits keep coming']
+  }[name];
+  return X || GENERIC_EX[name] || ['Explain this concept in one sentence and give one example from your own game.', 'See the definition and your numbers on this page.'];
+}
+var GENERIC_EX = {
+  'Working capital and liquidity': ['Why can a business that shows a profit still be unable to pay its supplier tomorrow?', 'Profit counts goods used, not cash paid: cash can be tied up in stock or equipment.'],
+  'Cost of debt and leverage': ['A loan of ₹10,000 at 2% a day is repaid after 10 days. How much simple interest is paid?', '₹10,000 × 2% × 10 = ₹2,000'],
+  'Choice of lender (cost of capital)': ['How much does ₹5,000 from the moneylender at 20% a day grow to after 5 days, compounded?', '₹5,000 × 1.2⁵ ≈ ₹12,442'],
+  'Debt servicing and default risk': ['Daily profit is ₹600 on a normal day and ₹100 on a rainy day. Is an EMI of ₹400 a day safe?', 'No: coverage is 1.5× on normal days but 0.25× on rainy days, so bad weather causes missed payments.'],
+  'Production planning (matching supply to demand)': ['You made 60 cups and 48 customers wanted one. What was the match ratio?', '48 ÷ 60 = 80%'],
+  'Capacity and stock-outs': ['120 customers wanted lemonade and you could serve 100. What share of demand did you lose?', '20 ÷ 120 ≈ 17%'],
+  'Perishable goods (spoilage)': ['Why does first in, first out (FIFO) matter for perishable stock?', 'Older stock is used before it spoils, so less is thrown away.'],
+  'Product quality': ['Which two ingredients most affect taste in the game?', 'Lemons and sugar (and ice for the weather).'],
+  'Process consistency': ['Taste was 100, 100, 80, 100 on four days. Which day hurt consistency, and what would an SOP fix?', 'The 80 day; a fixed recipe for each weather type.'],
+  'Purchasing and supplier deals': ['Sugar is 25% cheaper and keeps for weeks; lemons are 25% cheaper but spoil in 3 days. Which do you stock up on?', 'Sugar: extra lemons would spoil.'],
+  'Value-based pricing': ['The fair price on a hot day is ₹60. You charge ₹75. What is your price index, and the risk?', '125%: many passers-by decide not to buy.'],
+  'Dynamic pricing (responding to demand)': ['Should price go up or down on a festival day with 80% more people?', 'Up, moderately: demand is higher and capacity is limited.'],
+  'Marketing return on investment': ['Ads cost ₹200 and brought 10 extra buyers at ₹36 contribution each. Worth it?', '₹360 − ₹200 = ₹160 gain: yes.'],
+  'Targeting marketing spend': ['On which forecasts would you stop advertising, and why?', 'Rainy and stormy: few passers-by, so ads cannot pay back.'],
+  'Product differentiation': ['Pink lemonade uses one extra lemon per pitcher but sells higher. When is it worth making?', 'When the extra price per cup covers the extra lemon cost per cup.'],
+  'Brand equity and reputation': ['Name three decisions that raise reputation.', 'High taste, fair prices, serving every customer.'],
+  'Using forecasts (decisions under uncertainty)': ['The forecast says rainy with a 20% chance of sun. How much ice do you use?', 'Little, as for rain: plan for the most likely outcome.'],
+  'Risk management': ['On a storm forecast: open with full stock, open small, or close?', 'Close, or open small with no ads: sales will not cover costs.'],
+  'Loss aversion (behavioural bias)': ['Yesterday was rainy and you lost ₹100. Today is sunny. Cut your price?', 'No: the loss came from the weather, not the price.'],
+  'Responding to market events': ['A festival brings 80% more people. Name two decisions you would change.', 'Make more pitchers and raise the price slightly.'],
+  'Competitive response': ['A rival runs a two-day promotion. Two ways to protect sales?', 'Price slightly lower; keep taste high.'],
+  'Capital investment decisions': ['An upgrade costs ₹3,000 and adds ₹150 profit a day. Payback period?', '20 days'],
+  'Business growth and scale': ['When is the right time to move to a bigger stand?', 'When customers are often turned away and profit covers the higher fee.'],
+  'Equity financing and dilution': ['An investor gives ₹1,00,000 for 30% of profits; profit is ₹2,000 a day. Daily cost of the deal?', '₹600 a day'],
+  'Timing of expansion': ['Name two signals that it is time to expand.', 'Frequent stock-outs and a steady cash cushion.'],
+  'Return on investment (upgrades)': ['An upgrade cost ₹5,000 and raised profit by ₹100 a day. ROI after 100 days?', '(₹10,000 − ₹5,000) ÷ ₹5,000 = 100%'],
+  'Sustainable growth': ['Why is steady growth safer than fast growth on loans?', 'It is paid for by profit, so a bad period does not trigger debt problems.'],
+  'Scaling through stand tiers': ['Your stand serves up to 100 cups and you sell 45. Capacity use, and what it suggests?', '45%: demand, not capacity, limits sales; work on price and marketing.'],
+  'Workforce planning (staffing to demand)': ['On which days should you hire the helper?', 'Hot and sunny days, festivals and holidays.'],
+  'Employee morale': ['One way to protect staff morale in a bad week?', 'Cut losses by closing on storm days; pay wages on time.'],
+  'Labour productivity': ['The helper adds 40 cups of capacity at ₹300 a day, but only 5 extra cups sell at ₹36 contribution. Worth it?', '5 × ₹36 = ₹180 < ₹300: no.'],
+  'Fixed costs and operating leverage (hiring)': ['Why does a helper make bad-weather days more costly?', 'The wage is paid even when few customers come.'],
+  'Regulatory compliance': ['Why is buying the permit early a financial decision as well as an ethical one?', 'It costs once and stops fines and bribes that recur.'],
+  'Corruption as a recurring cost': ['An officer asks for ₹1,000; the permit costs ₹2,000. Over 6 visits, which is cheaper?', 'The permit: ₹2,000 once against ₹6,000 (and bribery is illegal).']
+};
+
+/* ---------- the student workbook ---------- */
+function studentHtml(s, g, all) {
+  var today = Utilities.formatDate(new Date(), 'Asia/Kolkata', 'd MMM yyyy'), cur = s.cur, m = function (x) { return money(x, cur); }, mk = s.mk, k = s.k, H = [];
+  var page = function (part, title, body, flow) { H.push('<div class="pg' + (flow ? ' flow' : '') + '"><div class="part">' + e(part) + '</div><h2>' + e(title) + '</h2>' + body + '</div>'); };
+  var head0 = '<h1>' + e(s.name) + '</h1><div class="muted">Player ' + e(s.pid) + ' · ' + e(s.college || g.college) + ' · ' + e(g.name) + ' (' + e(g.code) + ')' + (g.batch ? ' · ' + e(g.batch) : '') +
+    '<br>Lemonade Stand: Business Sim · Student workbook · ' + today + '</div>';
+  var attRows = s.att.map(function (a) {
+    var st = a.n === s.detailN && mk ? 'Graded (best attempt)' : { abandoned: 'Ignored: restarted while the stand still had money', failed: 'Failed: ran out of money (−5)', progress: 'In progress (not counted under 5 days)', current: 'Counted, but another attempt scored higher' }[a.status];
+    return '<tr><td>' + a.n + '</td><td>' + e(a.days[0] ? a.days[0].at : '') + ' → ' + e(a.days.length ? a.days[a.days.length - 1].at : '') + '</td><td class="n">' + a.days.length + '</td><td class="n">' + (a.mk ? a.mk.marks : '—') + '</td><td class="n">' + (a.days.length ? m(a.days[a.days.length - 1].nw) : '—') + '</td><td>' + st + '</td></tr>'; }).join('');
+  var attTable = '<table><tr><th>#</th><th>Played</th><th class="n">Days</th><th class="n">Marks</th><th class="n">Final net worth</th><th>Counted as</th></tr>' + attRows + '</table>';
+  if (!mk) { page('Result', 'Not graded yet', head0 + '<h3>Attempts in this group</h3>' + attTable + '<p>Grading needs one game of at least ' + MIN_DAYS + ' days played after joining the group.</p>'); return '<html><head><meta charset="utf-8">' + WB_CSS + '</head><body>' + H.join('') + '</body></html>'; }
+  var F = attemptFacts(s.days), n = F.n, graded = all.filter(function (x) { return x.mk && !x.mk.inc; });
+  var areaB = {}; AREA_ORDER.forEach(function (a) { var v = graded.map(function (x) { var r = areaOf(x, a); return r ? r.m : null; }); areaB[a] = { med: pctile(v, 0.5), top: pctile(v, 0.9), avg: r1(avgOf(v.filter(function (x) { return x != null; }), function (x) { return x; })) }; });
+  var cAvg = {}; graded.forEach(function (x) { (x.cs ? x.cs.list : []).forEach(function (c) { (cAvg[c.name] = cAvg[c.name] || []).push(c.s); }); });
+  var cav = function (nm) { return cAvg[nm] ? Math.round(avgOf(cAvg[nm], function (x) { return x; })) : '—'; };
+  var list = s.cs.list, strong = list.slice().sort(function (a, b) { return b.s - a.s; }).slice(0, 3), weak = list.slice().sort(function (a, b) { return a.s - b.s; }).slice(0, 3);
+  var grd = mk.inc ? 'I' : mk.gr.g, dfB = { easy: 'Easy', normal: 'Normal', hard: 'Hard' }[mk.dif] || 'Normal';
+  var mod = s.mod && s.mod.m !== '' ? s.mod : null;
+  // Part 1
+  var verdict = e(s.name.split(' ')[0]) + ' played ' + n + ' days in the graded attempt, ending with net worth ' + m(s.days[n - 1].nw) + '. Strongest in ' + e(strong[0].name.split(' (')[0]) + ' and ' + e(strong[1].name.split(' (')[0]) +
+    '; weakest in ' + e(weak[0].name.split(' (')[0]) + ' and ' + e(weak[1].name.split(' (')[0]) + '.' + (mk.caps.length ? ' Adjustments: ' + e(mk.caps.join('; ')) + '.' : '') +
+    (mk.inc ? ' <b>Incomplete:</b> play at least ' + EVIDENCE_DAYS + ' days in one game (' + (EVIDENCE_DAYS - n) + ' more) before the reports are made Final.' : '');
+  var steps = [['Concepts (A)', r1(mk.A * mk.ev), 'add'], ['Results (B)', r1(mk.B * mk.ev), 'add'], ['Persistence (C)', mk.C, 'add'], ['Before penalties', mk.base, 'total']];
+  if (mk.penB) steps.push(['Bribes', mk.penB, 'sub']);
+  var capD = r1(mk.base - mk.penB - mk.attempt); if (capD > 0.05) steps.push(['Cap', capD, 'sub']);
+  if (mk.failPen) steps.push(['Failed games', mk.failPen, 'sub']);
+  steps.push([s.quizPct != null && s.game != null && s.game !== mk.marks ? 'Game marks' : 'Final', r1(Math.max(0, mk.attempt - mk.failPen)), 'total']);
+  var p1 = '<table style="border:0"><tr><td style="border:0">' + head0 + '</td><td style="border:0;text-align:right;width:120px"><div class="gr" style="color:' + GCOL[grd] + '">' + grd + '</div><div class="muted">' + mk.marks + ' marks · ' + mk.gr.gp + ' points</div></td></tr></table>' +
+    '<div><div class="kp"><b>' + mk.marks + '</b><span>Final marks out of 100</span></div><div class="kp"><b>' + (s.rank ? s.rank + ' of ' + graded.length : (mk.inc ? 'Incomplete' : '—')) + '</b><span>Rank in the class</span></div>' +
+    '<div class="kp"><b>' + n + ' days</b><span>Graded attempt (' + s.detailN + ' of ' + s.att.length + ')</span></div><div class="kp"><b>' + m(mk.avgP) + '</b><span>Profit a day (benchmark ' + m(mk.ben) + ')</span></div></div>' +
+    '<div class="bx nt"><b>Summary.</b> ' + verdict + '</div>' + (mod ? '<div class="bx wn"><b>Moderated by faculty: ' + mod.m + ' marks, grade ' + gradeOf(mod.m).g + '.</b> This replaces the calculated marks.' + (mod.c ? ' ' + e(mod.c) : '') + '</div>' : '') +
+    '<h3>How the marks were built</h3>' + vis(svBridge(steps), '') +
+    '<table><tr><th>Part</th><th class="n">Marks</th><th class="n">Out of</th><th>How</th></tr>' +
+    '<tr><td>A. Management concepts</td><td class="n">' + mk.A + '</td><td class="n">65</td><td>' + list.length + ' concepts in ' + mk.areas.length + ' areas, weighted by area</td></tr>' +
+    '<tr><td>B1. Average daily profit</td><td class="n">' + mk.B1 + '</td><td class="n">15</td><td>' + m(mk.avgP) + ' a day against the ' + dfB + ' benchmark ' + m(mk.ben) + '</td></tr>' +
+    '<tr><td>B2. Net worth growth</td><td class="n">' + mk.B2 + '</td><td class="n">10</td><td>' + m(mk.gpd) + ' a day against ' + m(mk.ben) + '</td></tr>' +
+    '<tr><td>C. Persistence</td><td class="n">' + mk.C + '</td><td class="n">10</td><td>' + n + ' days (full marks from ' + FULL_DAYS + ')</td></tr>' +
+    (mk.ev < 1 ? '<tr><td>Evidence factor</td><td class="n">× ' + mk.ev.toFixed(2) + '</td><td></td><td>Parts A and B scaled: ' + n + ' of ' + EVIDENCE_DAYS + ' days</td></tr>' : '') +
+    mk.caps.filter(function (c) { return !/^Evidence/.test(c); }).map(function (c) { return '<tr><td colspan="4">' + e(c) + '</td></tr>'; }).join('') +
+    '<tr><td><b>Final</b></td><td class="n"><b>' + mk.marks + '</b></td><td class="n">100</td><td>Grade ' + grd + (mk.inc ? ' (Incomplete)' : ' (' + mk.gr.gp + ' points)') + '</td></tr></table>';
+  page('Part 1 · Result summary', 'Your result', p1);
+  // Part 2
+  var strip = list.map(function (c) { var col = c.s >= 70 ? '#16a34a' : c.s >= 50 ? '#d97706' : '#dc2626';
+    return '<tr><td class="sm" style="width:46%">' + e(c.name.split(' (')[0]) + '</td><td>' + vis('<svg xmlns="http://www.w3.org/2000/svg" width="300" height="10" viewBox="0 0 300 10"><rect x="0" y="1" width="300" height="8" rx="3" fill="#e5e7eb"/><rect x="0" y="1" width="' + (3 * c.s) + '" height="8" rx="3" fill="' + col + '"/></svg>', hbar(c.s, col, 20)) + '</td><td class="n sm">' + c.s + '</td><td class="n sm muted">class ' + cav(c.name) + '</td></tr>'; }).join('');
+  page('Part 2 · Scorecard', 'Scorecard: where you are strong and weak',
+    '<p class="sm">Area scores (out of 100) against the class median (black tick) and top 10% (green tick).</p>' +
+    vis(svBars(mk.areas.map(function (a) { return [a.area, a.m, [areaB[a.area].med, areaB[a.area].top]]; })), hbars(mk.areas.map(function (a) { return [a.area, a.m, a.m + ' (class ' + areaB[a.area].avg + ')', GCOL[a.gr.g]]; }))) +
+    '<table style="border:0"><tr><td style="border:0;width:50%"><div class="bx ok"><b>Strongest</b><ol>' + strong.map(function (c) { return '<li>' + e(c.name) + ': <b>' + c.s + '</b> (class ' + cav(c.name) + ')</li>'; }).join('') + '</ol></div></td>' +
+    '<td style="border:0"><div class="bx wn"><b>Weakest</b><ol>' + weak.map(function (c) { return '<li>' + e(c.name) + ': <b>' + c.s + '</b> (class ' + cav(c.name) + ')</li>'; }).join('') + '</ol></div></td></tr></table>' +
+    '<h3>All ' + list.length + ' scored concepts</h3><table style="font-size:8.5pt;line-height:1.15">' + strip + '</table>');
+  // Part 3
+  var firstOf = function (re) { var x = F.ev.filter(function (v) { return re.test(v[1]); })[0]; return x ? x[0] : null; };
+  var marks3 = [[/Permit/, 'Permit'], [/tier/, 'Bigger stand'], [/helper/, 'Helper'], [/pink/, 'Pink lemonade'], [/investor/, 'Angel investor'], [/moneylender/, 'Moneylender']].map(function (x) { var d = firstOf(x[0]); return d ? [d, x[1] + ' (day ' + d + ')'] : null; }).filter(Boolean);
+  page('Part 3 · Game journey', 'Your game journey', '<h3>Attempts in this group</h3>' + attTable +
+    '<h3>Net worth over the graded attempt</h3>' + vis(svLine(s.days.map(function (d) { return [d.d, d.nw]; }), { marks: marks3, fmt: m, label: 'Net worth' }), chartImg('line', s.days.slice(-60).map(function (d) { return ['D' + d.d, rupees(d.nw, cur)]; }), '#2563eb', 'Net worth')) +
+    '<h3>Daily profit, coloured by weather</h3><div class="sm">' + WXO.map(function (w) { return '<span style="color:' + WXC[w] + '">■</span> ' + WXN[w]; }).join(' &nbsp; ') + '</div>' +
+    vis(svProfit(s.days, cur), chartImg('column', s.days.slice(-60).map(function (d) { return ['D' + d.d, rupees(d.np, cur)]; }), '#16a34a', 'Profit')));
+  var km = [[F.best.d, 'Best day: ' + m(F.best.np) + ' profit (' + (WXN[F.best.w] || F.best.w) + (F.best.ev ? ', ' + (EVN[F.best.ev] || F.best.ev) : '') + ', ' + F.best.sv + ' cups at ' + m(F.best.pr) + ')'],
+    [F.worst.d, 'Worst day: ' + m(F.worst.np) + ' (' + (F.worst.cl ? 'closed, ' : '') + (WXN[F.worst.w] || F.worst.w) + ')']].concat(F.ev).sort(function (a, b) { return a[0] - b[0]; });
+  page('Part 3 · Game journey (continued)', 'Key moments and progress',
+    '<h3>Key moments</h3><table><tr><th class="n">Day</th><th>What happened</th></tr>' + km.slice(0, 16).map(function (x) { return '<tr><td class="n">' + x[0] + '</td><td>' + e(x[1]) + '</td></tr>'; }).join('') + '</table>' +
+    (km.length > 16 ? '<p class="sm muted">' + (km.length - 16) + ' more events are in the day-by-day appendix.</p>' : '') +
+    '<h3>Progress in blocks of days</h3><table><tr><th>Days</th><th class="n">Profit a day</th><th class="n">Price</th><th class="n">Cups a day</th><th class="n">Waste</th><th class="n">Taste</th><th class="n">Loss days</th><th class="n">Turned-away days</th></tr>' +
+    F.chunks.map(function (c) { return '<tr><td>' + c.from + '–' + c.to + '</td><td class="n">' + m(c.np) + '</td><td class="n">' + m(c.pr) + '</td><td class="n">' + Math.round(c.sv) + '</td><td class="n">' + pc(c.waste) + '</td><td class="n">' + Math.round(c.taste) + '</td><td class="n">' + c.loss + '</td><td class="n">' + c.ta + '</td></tr>'; }).join('') + '</table>');
+  // Part 4
+  var pl = F.pl, rev = pl.rev || 1, line = function (lab, v, b) { return '<tr' + (b ? ' style="font-weight:700"' : '') + '><td>' + lab + '</td><td class="n">' + m(v) + '</td><td class="n">' + m(v / n) + '</td><td class="n">' + (100 * v / rev).toFixed(1) + '%</td></tr>'; };
+  var plRows = line('Sales revenue', pl.rev) + line('Cost of cups sold (lemons, sugar, ice, cups)', -pl.cogs) + line('Gross profit', pl.rev - pl.cogs, 1) + line('Waste (lemonade poured away)', -pl.wst) + line('Spoilage (lemons, ice)', -pl.sp) +
+    line('Stand fee', -pl.fee) + line('Advertising', -pl.ad) + line('Helper wages', -pl.wg) + line('Interest and loan fees', -pl.int) + line('Fines and penalties', -pl.fine) + line('Bribes', -pl.bribe) +
+    line('Tax (10% of weekly profit)', -pl.tax) + line('Angel investor\'s share', -pl.inv) + (Math.abs(pl.other) > 10 ? line('Equipment wear and resale of upgrades', pl.other) : '') + line('Net profit', pl.np, 1);
+  var big = [['helper wages', pl.wg], ['advertising', pl.ad], ['the stand fee', pl.fee], ['waste and spoilage', pl.wst + pl.sp], ['tax', pl.tax], ['interest', pl.int], ['fines and bribes', pl.fine + pl.bribe]].sort(function (a, b) { return b[1] - a[1]; })[0];
+  page('Part 4 · Financial statements', 'Profit and loss', '<h3>Profit and loss statement (graded attempt, ' + n + ' days)</h3><table><tr><th>Line</th><th class="n">Total</th><th class="n">Per day</th><th class="n">% of sales</th></tr>' + plRows + '</table>' +
+    '<h3>Where each 100 of sales went</h3>' + vis(svStack([['Ingredients', pl.cogs, '#94a3b8'], ['Waste, spoilage', pl.wst + pl.sp, '#dc2626'], ['Stand fee', pl.fee, '#64748b'], ['Advertising', pl.ad, '#f59e0b'], ['Wages', pl.wg, '#a855f7'],
+      ['Interest', pl.int, '#7c3aed'], ['Tax', pl.tax, '#0ea5e9'], ['Investor', pl.inv, '#ec4899'], ['Fines, bribes', pl.fine + pl.bribe, '#7f1d1d'], ['Wear', -pl.other, '#475569'], ['Net profit', pl.np, '#16a34a']].filter(function (x) { return x[1] > 0; }), cur), '') +
+    '<div class="bx nt"><b>Reading it.</b> Of every 100 of sales, ' + Math.round(100 * pl.cogs / rev) + ' went on ingredients and ' + Math.round(100 * pl.np / rev) + ' stayed as profit. After ingredients, the biggest cost was ' + big[0] + ' (' + m(big[1]) + ', ' + Math.round(100 * big[1] / rev) + ' of every 100).</div>');
+  var d0 = s.days[0], dl = s.days[n - 1], low = s.days.filter(function (d) { return d.cash < 1000; }).length;
+  page('Part 4 · Financial statements (continued)', 'Balance sheet and cash', '<h3>Balance sheet: start and end of the graded attempt</h3><table><tr><th>Item</th><th class="n">Day 1</th><th class="n">Day ' + dl.d + '</th></tr>' +
+    '<tr><td>Cash</td><td class="n">' + m(d0.cash) + '</td><td class="n">' + m(dl.cash) + '</td></tr><tr><td>Stock and equipment</td><td class="n">' + m(d0.nw - d0.cash + d0.loan) + '</td><td class="n">' + m(dl.nw - dl.cash + dl.loan) + '</td></tr>' +
+    '<tr><td>Loans owed</td><td class="n">' + m(d0.loan) + '</td><td class="n">' + m(dl.loan) + '</td></tr><tr style="font-weight:700"><td>Net worth</td><td class="n">' + m(d0.nw) + '</td><td class="n">' + m(dl.nw) + '</td></tr></table>' +
+    '<h3>Cash and loans over time</h3>' + vis(svLine(s.days.map(function (d) { return [d.d, d.cash]; }), { color: '#0ea5e9', fmt: m, label: 'Cash' }), '') +
+    '<div class="bx"><b>Liquidity.</b> Cash was below ' + m(1000) + ' on ' + low + ' of ' + n + ' days; you had a loan on ' + pc(k.loanDays) + ' of days' + (s.days.some(function (d) { return d.rj > 0; }) ? ', including the moneylender at 20% a day' : '') + '.</div>');
+  // Part 5
+  var FAIR = function (w) { return 100 * (WX[w] || [1])[0]; };
+  var wx = WXO.filter(function (w) { return F.W[w]; }), Wr = function (w) { var o = F.W[w]; return { pr: o.pr / o.days, sv: o.sv / o.days, conv: o.pb ? o.by / o.pb : 0, np: o.np / o.days, ad: o.ad / o.days }; };
+  var badW = ['rainy', 'stormy'].filter(function (w) { return F.W[w]; }), goodW = ['hot', 'sunny', 'cloudy'].filter(function (w) { return F.W[w]; });
+  var over = goodW.length ? avgOf(goodW, function (w) { return Wr(w).pr / FAIR(w) - 1; }) : 0;
+  page('Part 5 · Decision analytics', 'Unit economics and pricing', '<h3>Unit economics</h3><div><div class="kp"><b>' + m(k.avgPrice) + '</b><span>Average price a cup</span></div><div class="kp"><b>' + m(k.costPerCup) + '</b><span>Ingredient cost a cup</span></div>' +
+    '<div class="kp"><b>' + m(k.contribution) + '</b><span>Contribution a cup (' + pc(k.avgPrice ? k.contribution / k.avgPrice : 0) + ')</span></div><div class="kp"><b>' + (k.contribution > 0 ? Math.ceil(F.fixed / k.contribution) : '—') + ' cups</b><span>Break-even a day (you sold ' + Math.round(k.avgCups) + ')</span></div></div>' +
+    '<h3>Pricing and demand by weather</h3><table><tr><th>Weather</th><th class="n">Days</th><th class="n">Your price</th><th class="n">Fair price</th><th class="n">Cups a day</th><th class="n">Conversion</th><th class="n">Ads a day</th><th class="n">Turned away</th><th class="n">Profit a day</th></tr>' +
+    wx.map(function (w) { var r = Wr(w); return '<tr><td>' + WXN[w] + '</td><td class="n">' + F.W[w].days + '</td><td class="n">' + m(r.pr) + '</td><td class="n">' + m(FAIR(w)) + '</td><td class="n">' + Math.round(r.sv) + '</td><td class="n">' + pc(r.conv) + '</td><td class="n">' + m(r.ad) + '</td><td class="n">' + F.W[w].ta + '</td><td class="n" style="color:' + (r.np >= 0 ? '#16a34a' : '#dc2626') + '">' + m(r.np) + '</td></tr>'; }).join('') + '</table>' +
+    vis(svCols(wx.map(function (w) { return WXN[w]; }), [wx.map(FAIR), wx.map(function (w) { return Wr(w).pr; })], ['Fair price', 'Your price'], ['#9ca3af', '#2563eb'], function (v) { return m(v); }), '') +
+    '<div class="bx nt"><b>What the numbers say.</b> In hot, sunny and cloudy weather you priced ' + (over >= 0 ? Math.round(100 * over) + '% above' : Math.round(-100 * over) + '% below') + ' the fair price on average' +
+    (k.elasticity != null ? '; measured price elasticity ' + k.elasticity.toFixed(2) + (Math.abs(k.elasticity) < 1.2 ? ' (buyers were not very sensitive to price)' : ' (buyers were price-sensitive)') : '') + '.' +
+    (badW.length ? ' On ' + badW.map(function (w) { return WXN[w].toLowerCase(); }).join(' and ') + ' days profit averaged ' + badW.map(function (w) { return m(Wr(w).np); }).join(' and ') + ' a day' + (badW.some(function (w) { return Wr(w).ad > 0; }) ? ', with advertising still running' : '') + '.' : '') + '</div>');
+  var cs = function (nm) { var c = list.filter(function (x) { return x.name === nm; })[0]; return c ? c.s : null; };
+  var opsN = ['Production planning (matching supply to demand)', 'Inventory control and waste', 'Capacity and stock-outs', 'Perishable goods (spoilage)', 'Product quality', 'Process consistency', 'Purchasing and supplier deals'].filter(function (x) { return cs(x) != null; });
+  var recipes = {}; s.days.forEach(function (d) { var key = (d.pd || 'classic') + ' ' + d.le + '/' + d.su + '/' + d.ic; recipes[key] = (recipes[key] || 0) + 1; });
+  page('Part 5 · Decision analytics (continued)', 'Operations and marketing', '<h3>Operations</h3>' +
+    vis(svBars(opsN.map(function (x) { return [x.split(' (')[0], cs(x), [cAvg[x] ? avgOf(cAvg[x], function (v) { return v; }) : null]]; })), hbars(opsN.map(function (x) { return [x, cs(x), cs(x) + '', '#2563eb']; }))) + '<p class="sm muted">Black tick = class average.</p>' +
+    '<div class="bx">You over-made lemonade on ' + pc(k.overMadeDays) + ' of days and turned customers away on ' + pc(k.stockOutDays) + ' of days, losing ' + pc(k.lostSales) + ' of buyers. Waste and spoilage were ' + pc(k.waste) + ' of ingredient cost; average taste ' + Math.round(k.taste || 0) + '.</div>' +
+    '<h3>Recipes used</h3><table><tr><th>Product and recipe (lemons/sugar/ice)</th><th class="n">Days</th></tr>' + Object.keys(recipes).sort(function (a, b) { return recipes[b] - recipes[a]; }).slice(0, 6).map(function (r) { return '<tr><td>' + e(r) + '</td><td class="n">' + recipes[r] + '</td></tr>'; }).join('') + '</table>' +
+    '<h3>Marketing</h3><table><tr><th>Measure</th><th class="n">You</th></tr><tr><td>Days with advertising</td><td class="n">' + (k.adDays || 0) + ' of ' + n + ' (' + m(pl.ad) + ')</td></tr>' +
+    '<tr><td>Marketing return (extra profit per rupee of ads)</td><td class="n">' + (k.adReturn == null ? 'not measurable' : k.adReturn.toFixed(2) + '×') + '</td></tr><tr><td>Conversion (passers-by who bought)</td><td class="n">' + pc(k.conversion) + '</td></tr>' +
+    '<tr><td>Reputation, start → end</td><td class="n">' + (s.days[0].rep - (s.days[0].rd || 0)) + ' → ' + dl.rep + '</td></tr></table>');
+  var helperD = s.days.filter(function (d) { return d.hp; }).length, visits = s.days.filter(function (d) { return d.of; });
+  page('Part 5 · Decision analytics (continued)', 'Risk, growth and compliance', '<h3>Risk and behaviour</h3><table><tr><th>Measure</th><th class="n">You</th></tr>' +
+    '<tr><td>Average profit on rainy and stormy days</td><td class="n">' + (k.badWeatherProfit == null ? '—' : m(k.badWeatherProfit)) + '</td></tr><tr><td>Price cut the day after a loss</td><td class="n">' + pc(k.cutAfterLoss) + ' (balanced ≈ 40%)</td></tr>' +
+    '<tr><td>Profit, first 7 days → latest 7 days</td><td class="n">' + (k.first7 == null ? '—' : m(k.first7) + ' → ' + m(k.last7)) + '</td></tr><tr><td>Profitable days</td><td class="n">' + pc(k.profitableShare) + '</td></tr></table>' +
+    '<h3>Growth and investment</h3><table><tr><th>Decision</th><th class="n">You</th></tr><tr><td>Upgrades owned at the end</td><td class="n">' + (dl.up || 0) + '</td></tr><tr><td>Stand tier reached</td><td class="n">' + (dl.tier || 1) + '</td></tr>' +
+    '<tr><td>Helper hired</td><td class="n">' + helperD + ' of ' + n + ' days (' + m(pl.wg) + ' wages)</td></tr><tr><td>Angel investor\'s share paid</td><td class="n">' + m(pl.inv) + '</td></tr></table>' +
+    list.filter(function (c) { return c.area === 'Strategy and growth' || c.area === 'People and organisation'; }).filter(function (c) { return c.s < 50 && c.bad; }).map(function (c) { return '<div class="bx wn"><b>' + e(c.name) + ' (' + c.s + ').</b> ' + e(c.bad) + ' ' + e(c.tip) + '</div>'; }).join('') +
+    '<h3>Compliance</h3><p>' + (visits.length ? 'The officer visited on day' + (visits.length > 1 ? 's ' : ' ') + visits.map(function (d) { return d.d + ' (' + d.of + ')'; }).join(', ') + '. ' : 'The officer never visited. ') +
+    (k.permit ? 'You bought the Street Vending Permit' + (firstOf(/Permit/) ? ' on day ' + firstOf(/Permit/) : '') + '.' : 'You did not buy the Street Vending Permit.') + ' Bribes paid: ' + (k.bribes || 0) + ' (' + m(pl.bribe) + '); fines and penalties ' + m(pl.fine) + '.</p>');
+  // Part 6
+  var exk = [], areas = AREA_ORDER;
+  areas.forEach(function (a, ai) {
+    var ar = areaOf(s, a), names = list.filter(function (c) { return c.area === a; }).map(function (c) { return c.name; });
+    var notMet = (s.cs.missing || []).filter(function (x) { return NOTES[x] && conceptArea(x) === a; });
+    var body = '<p>' + e(AREA_INTRO[a]) + ' Your score: <b>' + (ar ? ar.m : '—') + '</b> (class median ' + (areaB[a].med == null ? '—' : Math.round(areaB[a].med)) + ', top 10% ' + (areaB[a].top == null ? '—' : Math.round(areaB[a].top)) + '). Weight ' + AREA_W[a] + ' of 65.</p>';
+    names.concat(notMet).forEach(function (nm) {
+      var nt = NOTES[nm] || { d: '', n: '', f: '', full: '' }, c = list.filter(function (x) { return x.name === nm; })[0], q = exercise(nm, s, F); exk.push([nm, q[0], q[1]]);
+      var head = c ? '<table style="border:0;margin:0"><tr><td style="border:0;padding:0"><b>' + e(nm) + '</b></td><td style="border:0;padding:0;text-align:right;white-space:nowrap"><b style="font-size:12pt;color:' + (c.s >= 70 ? '#16a34a' : c.s >= 50 ? '#b45309' : '#dc2626') + '">' + c.s + '</b><span class="muted"> / 100 · class ' + cav(nm) + '</span></td></tr></table>'
+        : '<b>' + e(nm) + '</b> <span class="tag">not met in your game</span>';
+      var right = c ? '<div class="lb">In the game</div>' + e(c.applied) + '<div class="lb">Your numbers</div>' + e(c.calc || '') + '<div class="lb">How it was scored</div>Full marks when: ' + e(nt.full) + '. You scored ' + c.s + '. ' + e(c.good || '') + ' ' + e(c.bad || '') +
+        '<div class="lb">Try this next time</div>' + e(c.tip || '') : '<div class="muted">This did not come up in your graded attempt, so it is not scored. Study it for your next game.</div>';
+      body += '<div class="cc">' + head + '<div class="c2"><div><div class="lb">Definition</div>' + e(nt.d) + '<div class="lb">Conceptual note</div>' + e(nt.n) + '<div class="lb">Formula</div><span class="fm">' + e(nt.f) + '</span></div><div>' + right +
+        '<div class="lb">Self-check ' + exk.length + '</div>' + e(q[0]) + ' <span class="muted">(answer in Appendix B)</span></div></div></div>';
+    });
+    page('Part 6 · Concept workbook', a, body, ai < areas.length - 1);
+  });
+  // Part 7
+  var kp = function (f) { return graded.map(function (x) { return x.k && x.days.length ? f(x) : null; }); };
+  var bm = [['Profit a day', function (x) { return x.mk.avgP; }, m, 1], ['Net profit margin', function (x) { var r = x.days.reduce(function (t, d) { return t + d.rev; }, 0); return r ? x.k.profit / r : null; }, pc, 1],
+    ['Waste ratio (lower is better)', function (x) { return x.k.waste; }, pc, 0], ['Taste', function (x) { return x.k.taste; }, function (v) { return v == null ? '—' : Math.round(v); }, 1],
+    ['Conversion', function (x) { return x.k.conversion; }, pc, 1], ['Average price', function (x) { return x.k.avgPrice; }, m, 1], ['Days played', function (x) { return x.days.length; }, function (v) { return v == null ? '—' : Math.round(v); }, 1]];
+  page('Part 7 · Benchmarking', 'You and your class', '<p>Your graded attempt against the ' + graded.length + ' graded students in ' + e(g.name) + '. "Best 10%" is the top tenth, or the lowest tenth where lower is better.</p>' +
+    '<table><tr><th>Measure</th><th class="n">You</th><th class="n">Class median</th><th class="n">Best 10%</th></tr>' + bm.map(function (b) { var v = kp(b[1]); return '<tr><td>' + b[0] + '</td><td class="n"><b>' + b[2](b[1](s)) + '</b></td><td class="n">' + b[2](pctile(v, 0.5)) + '</td><td class="n">' + b[2](pctile(v, b[3] ? 0.9 : 0.1)) + '</td></tr>'; }).join('') + '</table>' +
+    '<h3>Area scores against the class</h3><table><tr><th>Area</th><th class="n">You</th><th class="n">Class average</th><th class="n">Median</th><th class="n">Top 10%</th></tr>' +
+    mk.areas.map(function (a) { var b = areaB[a.area]; return '<tr><td>' + e(a.area) + '</td><td class="n"><b>' + a.m + '</b></td><td class="n">' + b.avg + '</td><td class="n">' + Math.round(b.med) + '</td><td class="n">' + Math.round(b.top) + '</td></tr>'; }).join('') + '</table>' +
+    '<h3>Class grade spread</h3>' + gradeSpread(all));
+  // Part 8
+  var pri = [];
+  if (k.bribes) pri.push(['Buy the Street Vending Permit at the first officer visit', '0 bribes', k.bribes + ' bribes cost ' + mk.penB + ' marks and ' + m(pl.bribe)]);
+  if (s.days.some(function (d) { return d.rj > 0; })) pri.push(['Never borrow from the moneylender', 'No moneylender days', 'At 20% a day the debt more than doubles in 4 days']);
+  if (mk.ev < 1) pri.push(['Play at least ' + EVIDENCE_DAYS + ' days in one game', EVIDENCE_DAYS + '+ days', 'Short games scale Parts A and B down']);
+  weak.forEach(function (c) { if (pri.length < 3) pri.push([c.tip, c.name.split(' (')[0] + ' above 60', c.bad || 'Your weakest concepts']); });
+  page('Part 8 · Improvement plan', 'Your improvement plan', '<h3>Three priorities for your next game</h3><table><tr><th>#</th><th>Priority</th><th>Target</th><th>Why</th></tr>' + pri.slice(0, 3).map(function (p, i) { return '<tr><td>' + (i + 1) + '</td><td>' + e(p[0]) + '</td><td>' + e(p[1]) + '</td><td>' + e(p[2]) + '</td></tr>'; }).join('') + '</table>' +
+    '<h3>Daily decision checklist</h3><ol><li>Read the forecast and any event: is today busy, normal or slow?</li><li>Busy: more pitchers, price about 5–10% above fair, helper on. Slow: fewer pitchers, no ads, no helper. Storm: consider closing.</li>' +
+    '<li>Recipe: keep taste above 90; set ice by the weather.</li><li>Check break-even cups against the expected crowd before spending on ads.</li><li>Keep one day\'s stock money in cash; avoid the moneylender; buy the permit early.</li></ol>' +
+    '<h3>Reflection questions</h3><ol><li>Which single decision would have raised your marks the most, and by how much?</li><li>Compare your best and worst day: what did you do differently?</li><li>Was every upgrade and hire worth its cost? Use your own numbers.</li><li>Where did your price differ most from the fair price, and what happened to sales?</li><li>What will you do differently in your next game?</li></ol>');
+  // Part 9
+  page('Part 9 · Formula sheet', 'Formula sheet', '<p class="sm muted">Definitions are on each concept\'s page in Part 6.</p><table style="font-size:8.5pt"><tr><th style="width:34%">Term</th><th>Formula</th></tr>' +
+    Object.keys(NOTES).sort().map(function (nm) { return '<tr><td><b>' + e(nm.split(' (')[0]) + '</b></td><td>' + e(NOTES[nm].f) + '</td></tr>'; }).join('') + '</table>', true);
+  page('Part 9 · How marks were worked out', 'Marks calculation and moderation', '<ol><li><b>Graded attempt:</b> attempt ' + s.detailN + ' (' + n + ' days), your best attempt of ' + MIN_DAYS + ' or more days. ' +
+    s.att.filter(function (a) { return a.n !== s.detailN; }).map(function (a) { return 'Attempt ' + a.n + ': ' + { abandoned: 'restarted while solvent, ignored', failed: 'ran out of money, −5', progress: 'in progress', current: 'counted, lower marks' }[a.status]; }).join('; ') + '.</li>' +
+    '<li><b>Part A, concepts:</b> area = average of its concept scores; areas weighted ' + AREA_ORDER.map(function (a) { return a.split(' ')[0] + ' ' + AREA_W[a]; }).join(', ') + ' (of 65). Yours: ' + mk.A + '.</li>' +
+    '<li><b>Part B, results:</b> profit ' + m(mk.avgP) + ' a day → ' + mk.B1 + ' of 15; net worth growth ' + m(mk.gpd) + ' a day → ' + mk.B2 + ' of 10 (' + dfB + ' benchmark ' + m(mk.ben) + ').</li>' +
+    '<li><b>Part C, persistence:</b> ' + n + ' days → ' + mk.C + ' of 10.</li><li><b>Evidence factor:</b> × ' + mk.ev.toFixed(2) + (mk.ev < 1 ? ' (fewer than ' + EVIDENCE_DAYS + ' days)' : '') + '.</li>' +
+    '<li><b>Penalties and caps:</b> ' + (mk.caps.filter(function (c) { return !/^Evidence|^Quiz/.test(c); }).map(e).join('; ') || 'none') + '.</li>' +
+    (mk.caps.some(function (c) { return /^Quiz/.test(c); }) ? '<li><b>Quiz:</b> ' + e(mk.caps.filter(function (c) { return /^Quiz/.test(c); })[0]) + '.</li>' : '') +
+    '<li><b>Final:</b> ' + mk.marks + ', grade ' + grd + (mk.inc ? ' (Incomplete until ' + EVIDENCE_DAYS + ' days or until reports are Final)' : ' (' + mk.gr.gp + ' points)') + '.</li></ol>' +
+    '<div class="bx"><b>Faculty moderation:</b> ' + (mod ? mod.m + ' marks, grade ' + gradeOf(mod.m).g + (mod.c ? '. ' + e(mod.c).replace(/\n/g, '<br>') : '') : '<span class="muted">none.</span>') + '</div>');
+  // Appendix
+  var dr = function (d) { return '<tr><td class="n">' + d.d + '</td><td>' + (d.cl ? 'closed' : (WXN[d.w] || d.w)) + '</td><td>' + (d.pd || '') + ' ' + d.le + '/' + d.su + '/' + d.ic + '</td><td class="n">' + m(d.pr) + '</td><td class="n">' + d.pb + '</td><td class="n">' + d.by + '</td><td class="n">' + d.sv + '</td><td class="n">' + d.ta + '</td><td class="n">' + m(d.ad || 0) + '</td><td class="n">' + m(d.np) + '</td><td>' + e(EVN[d.ev] || d.ev || '') + '</td></tr>'; };
+  var hdr = '<tr><th class="n">Day</th><th>Weather</th><th>Recipe</th><th class="n">Price</th><th class="n">Passers</th><th class="n">Buyers</th><th class="n">Served</th><th class="n">Turned away</th><th class="n">Ads</th><th class="n">Profit</th><th>Event</th></tr>';
+  var showAll = n <= 60;
+  page('Appendix A', 'Day-by-day decisions', showAll ? '<table class="sm">' + hdr + s.days.map(dr).join('') + '</table>' :
+    '<h3>First 10 days</h3><table class="sm">' + hdr + s.days.slice(0, 10).map(dr).join('') + '</table><h3>Latest 15 days</h3><table class="sm">' + hdr + s.days.slice(-15).map(dr).join('') + '</table><p class="sm muted">The other days are summarised in blocks in Part 3.</p>');
+  page('Appendix B', 'Answers to the self-check exercises', '<table class="sm"><tr><th>#</th><th>Concept</th><th>Question</th><th>Answer</th></tr>' + exk.map(function (x, i) { return '<tr><td>' + (i + 1) + '</td><td>' + e(x[0].split(' (')[0]) + '</td><td>' + e(x[1]) + '</td><td>' + e(x[2]) + '</td></tr>'; }).join('') + '</table>');
+  return '<html><head><meta charset="utf-8"><title>' + e(s.name) + ' · Lemonade Stand workbook</title>' + WB_CSS + '</head><body>' + H.join('') +
+    '<p class="muted sm">Lemonade Stand: Business Sim · reports by Dr. Govindraj R. Mane, Department of MBA, KLS Gogte Institute of Technology, Belagavi. Marks are computed from the student\'s own game decisions (grading rules version 2).</p></body></html>';
+}
+function conceptArea(nm) { return { 'Taxation and tax planning': 'Finance and accounting', 'Responding to market events': 'Economics and decision-making', 'Scaling through stand tiers': 'Strategy and growth' }[nm] || ''; }
+function gradeSpread(students) {
+  var dist = {}; GRADES.concat([[0, 'I', 0]]).forEach(function (g) { dist[g[1]] = 0; }); students.forEach(function (s) { if (s.mk) dist[s.mk.inc ? 'I' : s.mk.gr.g]++; });
+  var keys = GRADES.map(function (g) { return g[1]; }).concat(dist.I ? ['I'] : []);
+  return vis(svCols(keys, [keys.map(function (k) { return dist[k]; })], ['Students'], ['#9ca3af'], function (v) { return v; }), '') +
+    '<table style="width:70%"><tr>' + keys.map(function (k) { return '<th style="text-align:center;color:' + GCOL[k] + '">' + k + '</th>'; }).join('') + '</tr><tr>' + keys.map(function (k) { return '<td style="text-align:center">' + dist[k] + '</td>'; }).join('') + '</tr></table>';
+}
+
+/* ---------- faculty group report ---------- */
+function groupHtml(g, students) {
+  var today = Utilities.formatDate(new Date(), 'Asia/Kolkata', 'd MMM yyyy'), H = [], m = function (x) { return money(x, 'INR'); };
+  var page = function (part, title, body) { H.push('<div class="pg"><div class="part">' + e(part) + '</div><h2>' + e(title) + '</h2>' + body + '</div>'); };
+  var all = students.filter(function (s) { return s.mk; }), gr = all.filter(function (s) { return !s.mk.inc; }), inc = all.filter(function (s) { return s.mk.inc; }), st = classStats(students);
+  var ng = students.filter(function (s) { return !s.mk; });
+  var head0 = '<h1>' + e(g.name) + '</h1><div class="muted">' + e(g.code) + ' · ' + e(g.college) + (g.batch ? ' · ' + e(g.batch) : '') + (g.ownerName ? ' · ' + e(g.ownerName) : '') + ' · Faculty group report · ' + today + ' · ' + (REP_FINAL ? 'reports Final' : 'draft (Incomplete students not yet graded)') + '</div>';
+  if (!st.n) { page('Part 1', 'Class dashboard', head0 + '<p>No student is graded yet (each needs a game of ' + MIN_DAYS + ' or more days).</p>'); return '<html><head><meta charset="utf-8">' + WB_CSS + '</head><body>' + H.join('') + '</body></html>'; }
+  var marks = gr.map(function (s) { return s.mk.marks; }), hist = []; for (var b = 0; b < 100; b += 10) hist.push(marks.filter(function (x) { return x >= b && (x < b + 10 || (b === 90 && x <= 100)); }).length);
+  page('Part 1 · Class dashboard', 'Class dashboard', head0 + '<div style="margin-top:8px"><div class="kp"><b>' + students.length + '</b><span>Students in the group</span></div><div class="kp"><b>' + st.n + '</b><span>Graded</span></div><div class="kp"><b>' + inc.length + '</b><span>Incomplete (under ' + EVIDENCE_DAYS + ' days, below 40)</span></div><div class="kp"><b>' + ng.length + '</b><span>Not graded (no 5-day game)</span></div>' +
+    '<div class="kp"><b>' + st.mean + '</b><span>Average marks</span></div><div class="kp"><b>' + st.median + '</b><span>Median marks</span></div><div class="kp"><b>' + st.pass + '</b><span>Pass rate (40+)</span></div><div class="kp"><b>' + st.gp + '</b><span>Average grade points</span></div></div>' +
+    '<h3>Grade distribution</h3>' + gradeSpread(students) + '<h3>Marks histogram (graded students)</h3>' + vis(svCols(['0–9', '10–19', '20–29', '30–39', '40–49', '50–59', '60–69', '70–79', '80–89', '90–100'], [hist], ['Students'], ['#2563eb'], function (v) { return v; }), ''));
+  var avg = function (f) { return r1(avgOf(gr, f)); }, aA = avg(function (s) { return s.mk.A * s.mk.ev; }), aB = avg(function (s) { return s.mk.B * s.mk.ev; }), aC = avg(function (s) { return s.mk.C; }), aP = avg(function (s) { return s.mk.penB; }), aF = avg(function (s) { return s.mk.failPen; });
+  page('Part 2 · Marks build-up', 'Where the class\'s marks come from', vis(svBridge([['Concepts (A)', aA, 'add'], ['Results (B)', aB, 'add'], ['Persistence (C)', aC, 'add'], ['Before penalties', r1(aA + aB + aC), 'total'], ['Bribes', aP, 'sub'], ['Failed games', aF, 'sub'], ['Average', st.mean, 'total']]), '') +
+    '<table><tr><th>Part</th><th class="n">Class average</th><th class="n">Out of</th></tr><tr><td>A. Concepts (after evidence factor)</td><td class="n">' + aA + '</td><td class="n">65</td></tr><tr><td>B. Results (after evidence factor)</td><td class="n">' + aB + '</td><td class="n">25</td></tr>' +
+    '<tr><td>C. Persistence</td><td class="n">' + aC + '</td><td class="n">10</td></tr><tr><td>Bribe penalties</td><td class="n">−' + aP + '</td><td></td></tr><tr><td>Failed-game penalties</td><td class="n">−' + aF + '</td><td></td></tr>' +
+    '<tr><td>Capped (5+ bribes, seizure, jail)</td><td class="n">' + gr.filter(function (s) { return s.mk.bribes >= 5 || s.mk.seized || s.mk.jail; }).length + ' students</td><td></td></tr></table>' +
+    '<div class="bx nt">The class loses most marks in <b>Part B</b> when its average is far below 25: that means many students made little or no profit a day, regardless of decision quality.</div>');
+  var byC = {}; gr.forEach(function (s) { (s.cs ? s.cs.list : []).forEach(function (c) { (byC[c.name] = byC[c.name] || { area: c.area, v: [] }).v.push(c.s); }); });
+  var cn = Object.keys(byC).map(function (nm) { var v = byC[nm].v; return { nm: nm, area: byC[nm].area, avg: r1(avgOf(v, function (x) { return x; })), n: v.length, low: v.filter(function (x) { return x < 50; }).length }; }).sort(function (a, b) { return a.avg - b.avg; });
+  var ar = AREA_ORDER.map(function (a) { var v = gr.map(function (s) { return areaOf(s, a); }).filter(Boolean).map(function (x) { return x.m; }); return v.length ? { a: a, avg: r1(avgOf(v, function (x) { return x; })), med: pctile(v, 0.5), top: pctile(v, 0.9), n: v.length } : null; }).filter(Boolean);
+  page('Part 3 · Area and concept analysis', 'What the class understands, and what it does not', vis(svBars(ar.map(function (x) { return [x.a, x.avg, [x.med, x.top]]; })), hbars(ar.map(function (x) { return [x.a, x.avg, x.avg + '', GCOL[gradeOf(x.avg).g]]; }))) +
+    '<p class="sm muted">Bars = class average; black tick = median; green tick = top 10%.</p><h3>The 10 weakest concepts</h3><table><tr><th>Concept</th><th>Area</th><th class="n">Class average</th><th class="n">Students below 50</th><th>Teaching note</th></tr>' +
+    cn.slice(0, 10).map(function (c) { return '<tr><td>' + e(c.nm) + '</td><td class="sm">' + e(c.area.split(' ')[0]) + '</td><td class="n"><b>' + c.avg + '</b></td><td class="n">' + c.low + ' of ' + c.n + '</td><td class="sm">' + e((NOTES[c.nm] || {}).full ? 'Full marks need: ' + NOTES[c.nm].full.toLowerCase() : '') + '</td></tr>'; }).join('') + '</table>' +
+    '<h3>All concepts, weakest first</h3><table class="sm"><tr><th>Concept</th><th class="n">Students</th><th class="n">Average</th><th class="n">Below 50</th></tr>' + cn.map(function (c) { return '<tr><td>' + e(c.nm) + '</td><td class="n">' + c.n + '</td><td class="n">' + c.avg + '</td><td class="n">' + c.low + '</td></tr>'; }).join('') + '</table>');
+  var kv = function (f) { return gr.map(f).filter(function (x) { return x != null && !isNaN(x); }); };
+  var krow = function (lab, f, fmt) { var v = kv(f); return '<tr><td>' + lab + '</td><td class="n">' + fmt(pctile(v, 0.1)) + '</td><td class="n">' + fmt(pctile(v, 0.5)) + '</td><td class="n">' + fmt(pctile(v, 0.9)) + '</td></tr>'; };
+  page('Part 4 · Business results', 'How the businesses performed', '<table><tr><th>Measure (graded attempt)</th><th class="n">Bottom 10%</th><th class="n">Median</th><th class="n">Top 10%</th></tr>' +
+    krow('Profit a day', function (s) { return s.mk.avgP; }, m) + krow('Net worth growth a day', function (s) { return s.mk.gpd; }, m) + krow('Net profit margin', function (s) { var r = s.days.reduce(function (t, d) { return t + d.rev; }, 0); return r ? s.k.profit / r : null; }, pc) +
+    krow('Waste ratio', function (s) { return s.k.waste; }, pc) + krow('Taste', function (s) { return s.k.taste; }, function (v) { return v == null ? '—' : Math.round(v); }) + krow('Conversion', function (s) { return s.k.conversion; }, pc) +
+    krow('Average price', function (s) { return s.k.avgPrice; }, m) + krow('Days played', function (s) { return s.days.length; }, function (v) { return v == null ? '—' : v; }) + '</table>' +
+    '<p>' + gr.filter(function (s) { return s.mk.avgP <= 0; }).length + ' of ' + gr.length + ' graded students lost money on an average day; ' + gr.filter(function (s) { return s.mk.avgP >= s.mk.ben; }).length + ' reached the profit benchmark.</p>');
+  var who = function (f) { var l = all.filter(f); return l.length + (l.length ? ': ' + l.slice(0, 12).map(function (s) { return e(s.name); }).join(', ') + (l.length > 12 ? ' and ' + (l.length - 12) + ' more' : '') : ''); };
+  var used = function (s, f) { return s.days.some(f); };
+  page('Part 5 · Behaviour and risk', 'Behaviour and risk', '<table><tr><th>Behaviour (graded attempt)</th><th>Students</th></tr>' +
+    '<tr><td>Borrowed from the moneylender</td><td>' + who(function (s) { return used(s, function (d) { return d.rj > 0; }); }) + '</td></tr>' +
+    '<tr><td>Equipment seized by a lender</td><td>' + who(function (s) { return s.mk.seized; }) + '</td></tr><tr><td>Went to jail</td><td>' + who(function (s) { return s.mk.jail; }) + '</td></tr>' +
+    '<tr><td>Failed games (ran out of money)</td><td>' + who(function (s) { return s.failed > 0; }) + '</td></tr><tr><td>Paid 5 or more bribes</td><td>' + who(function (s) { return s.mk.bribes >= 5; }) + '</td></tr>' +
+    '<tr><td>Paid 1–4 bribes</td><td>' + who(function (s) { return s.mk.bribes > 0 && s.mk.bribes < 5; }) + '</td></tr><tr><td>Bought the permit</td><td>' + who(function (s) { return s.k.permit; }) + '</td></tr>' +
+    '<tr><td>Hired a helper</td><td>' + who(function (s) { return used(s, function (d) { return d.hp; }); }) + '</td></tr><tr><td>Took an angel investor</td><td>' + who(function (s) { return used(s, function (d) { return d.iv > 0; }); }) + '</td></tr>' +
+    '<tr><td>Moved up a stand tier</td><td>' + who(function (s) { return used(s, function (d) { return d.tier > 1; }); }) + '</td></tr></table>');
+  var dh = [[5, 14], [15, 29], [30, 59], [60, 99], [100, 1e9]].map(function (r) { return all.filter(function (s) { return s.days.length >= r[0] && s.days.length <= r[1]; }).length; });
+  page('Part 6 · Attempts and persistence', 'Attempts and persistence', vis(svCols(['5–14', '15–29', '30–59', '60–99', '100+'], [dh], ['Students by days in graded attempt'], ['#2563eb'], function (v) { return v; }), '') +
+    '<table><tr><th>Measure</th><th class="n">Students</th></tr><tr><td>Restarted at least once</td><td class="n">' + students.filter(function (s) { return s.restarts > 0; }).length + '</td></tr>' +
+    '<tr><td>At least one failed game</td><td class="n">' + students.filter(function (s) { return s.failed > 0; }).length + '</td></tr><tr><td>Incomplete</td><td class="n">' + inc.length + '</td></tr><tr><td>Not graded</td><td class="n">' + ng.length + '</td></tr></table>' +
+    (inc.length ? '<h3>Incomplete students: days still needed</h3><table><tr><th>Student</th><th class="n">Days so far</th><th class="n">Days needed</th><th class="n">Marks so far</th></tr>' + inc.map(function (s) { return '<tr><td>' + e(s.name) + '</td><td class="n">' + s.days.length + '</td><td class="n">' + (EVIDENCE_DAYS - s.days.length) + '</td><td class="n">' + s.mk.marks + '</td></tr>'; }).join('') + '</table>' : ''));
+  var reason = function (s) { if (s.mk.inc || s.days.length < EVIDENCE_DAYS) return 'Stopped early'; if (s.mk.bribes >= 5) return 'Repeated bribery'; if (s.mk.avgP <= 0 || used(s, function (d) { return d.rj > 0; }) || s.mk.seized) return 'Losses and debt'; return 'Weak decisions'; };
+  var act = { 'Stopped early': 'Play at least ' + EVIDENCE_DAYS + ' days in one game', 'Repeated bribery': 'Buy the permit at the first officer visit', 'Losses and debt': 'Avoid the moneylender; check break-even before opening', 'Weak decisions': 'Work on the weakest area in the report' };
+  var att = all.filter(function (s) { return s.mk.inc || ['E', 'F'].indexOf(s.mk.gr.g) >= 0; }).sort(function (a, b) { return reason(a) < reason(b) ? -1 : reason(a) > reason(b) ? 1 : a.mk.marks - b.mk.marks; });
+  page('Part 7 · Students needing attention', 'Students needing attention', '<table><tr><th>Student</th><th class="n">Marks</th><th>Grade</th><th class="n">Days</th><th>Main reason</th><th>Most helpful action</th></tr>' +
+    att.map(function (s) { var r = reason(s); return '<tr><td>' + e(s.name) + '</td><td class="n">' + s.mk.marks + '</td><td style="color:' + GCOL[s.mk.gr.g] + '"><b>' + s.mk.gr.g + '</b></td><td class="n">' + s.days.length + '</td><td>' + r + '</td><td class="sm">' + act[r] + '</td></tr>'; }).join('') + '</table>');
+  var impr = all.map(function (s) { var a = s.att.filter(function (x) { return x.mk; }); return a.length > 1 ? { s: s, d: r1(s.mk.attempt - a[0].mk.marks) } : null; }).filter(function (x) { return x && x.d > 0; }).sort(function (a, b) { return b.d - a.d; });
+  page('Part 8 · Top performers and most improved', 'Top performers and most improved', '<h3>Top 10</h3><table><tr><th>#</th><th>Student</th><th class="n">Marks</th><th>Grade</th><th class="n">Days</th><th class="n">Profit a day</th></tr>' +
+    gr.slice(0, 10).map(function (s) { return '<tr><td>' + s.rank + '</td><td>' + e(s.name) + '</td><td class="n">' + s.mk.marks + '</td><td><b style="color:' + GCOL[s.mk.gr.g] + '">' + s.mk.gr.g + '</b></td><td class="n">' + s.days.length + '</td><td class="n">' + m(s.mk.avgP) + '</td></tr>'; }).join('') + '</table>' +
+    '<h3>Most improved (first eligible attempt → best attempt)</h3>' + (impr.length ? '<table><tr><th>Student</th><th class="n">Improvement in marks</th></tr>' + impr.slice(0, 10).map(function (x) { return '<tr><td>' + e(x.s.name) + '</td><td class="n">+' + x.d + '</td></tr>'; }).join('') + '</table>' : '<p class="muted">No student has two graded attempts yet.</p>'));
+  var qz = all.filter(function (s) { return s.quizPct != null; });
+  if (qz.length) page('Part 9 · Quizzes', 'Quiz results', '<p>Quiz marks for ' + qz.length + ' students; class average ' + r1(avgOf(qz, function (s) { return s.quizPct; })) + '%.</p><table><tr><th>Student</th><th class="n">Quiz %</th></tr>' + qz.sort(function (a, b) { return b.quizPct - a.quizPct; }).map(function (s) { return '<tr><td>' + e(s.name) + '</td><td class="n">' + s.quizPct + '</td></tr>'; }).join('') + '</table>');
+  var reasons = {}; att.forEach(function (s) { var r = reason(s); reasons[r] = (reasons[r] || 0) + 1; });
+  page('Part 10 · Teaching recommendations', 'Teaching recommendations', '<h3>Concepts to reteach</h3><ol>' + cn.slice(0, 3).map(function (c) { return '<li><b>' + e(c.nm) + '</b> (class average ' + c.avg + '; ' + c.low + ' students below 50). ' + e((NOTES[c.nm] || {}).d || '') + '</li>'; }).join('') + '</ol>' +
+    '<h3>Reminders before the deadline</h3><ul>' + Object.keys(reasons).sort(function (a, b) { return reasons[b] - reasons[a]; }).map(function (r) { return '<li>' + reasons[r] + ' student' + (reasons[r] > 1 ? 's' : '') + ' affected by <b>' + r.toLowerCase() + '</b>: ' + act[r] + '.</li>'; }).join('') + '</ul>' +
+    '<h3>Suggested market events for the next session</h3><ul><li><b>Storm forecast</b> to practise risk management (close or scale down).</li><li><b>Festival</b> to practise production planning and dynamic pricing.</li><li><b>Rival promotion</b> to practise competitive response.</li></ul>' +
+    '<p class="sm muted">For comparison with your other groups, use Compare sections in the admin panel.</p>');
+  page('Appendix', 'Full marks table', '<table class="sm"><tr><th>#</th><th>Student</th><th>Player ID</th><th class="n">Days</th><th class="n">Attempts</th><th class="n">A</th><th class="n">B</th><th class="n">C</th><th class="n">Penalties</th><th class="n">Marks</th><th>Grade</th></tr>' +
+    students.map(function (s) { var k2 = s.mk; return '<tr><td>' + (s.rank || '—') + '</td><td>' + e(s.name) + '</td><td>' + e(s.pid) + '</td><td class="n">' + s.days.length + '</td><td class="n">' + s.games + '</td><td class="n">' + (k2 ? k2.A : '') + '</td><td class="n">' + (k2 ? k2.B : '') + '</td><td class="n">' + (k2 ? k2.C : '') + '</td><td class="n">' + (k2 ? '−' + (k2.penB + k2.failPen) : '') + '</td><td class="n"><b>' + (k2 ? k2.marks : '—') + '</b></td><td>' + (k2 ? '<b style="color:' + GCOL[k2.gr.g] + '">' + k2.gr.g + '</b>' : 'Not graded') + '</td></tr>'; }).join('') + '</table>');
+  return '<html><head><meta charset="utf-8"><title>' + e(g.name) + ' · group report</title>' + WB_CSS + '</head><body>' + H.join('') + '</body></html>';
+}
